@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>docslatex</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;0,9..144,600;1,9..144,400;1,9..144,500&family=Geist:wght@300;400;500;600&family=Geist+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div class="grain" aria-hidden="true"></div>
+
+    <main class="card">
+
+      <section class="stage" aria-live="polite">
+        <h1 class="title">
+          <span class="title__line">LaTeX,</span>
+          <span class="title__line title__line--accent">
+            <em>natively compiling in</em>
+            <img
+              class="title__logo"
+              src="Google_Docs_logo.png"
+              alt="Google Docs"
+              draggable="false"
+            />
+          </span>
+        </h1>
+        <p class="lede">
+          simply enable and type in your doc.
+        </p>
+      </section>
+
+      <section class="action">
+        <div class="btn-wrap">
+          <button id="greet" class="btn" type="button" aria-pressed="false">
+            <span class="btn__label">Enable</span>
+            <span class="btn__icon" aria-hidden="true">
+              <svg class="btn__icon-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M5 12h14" />
+                <path d="m13 6 6 6-6 6" />
+              </svg>
+              <svg class="btn__icon-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M20 6 9 17l-5-5" />
+              </svg>
+            </span>
+          </button>
+          <div class="longpress-menu" id="longpress-menu" aria-hidden="true">
+            <button class="lp-btn" id="lp-with" type="button">
+              <span class="lp-btn__dot lp-btn__dot--green" aria-hidden="true"></span>
+              with autocompile
+            </button>
+            <button class="lp-btn" id="lp-without" type="button">
+              <span class="lp-btn__dot" aria-hidden="true"></span>
+              without autocompile
+            </button>
+          </div>
+        </div>
+
+        <label class="autocompile-toggle" id="autocompile-label" title="Recompile automatically as you type">
+          <input type="checkbox" id="autocompile" class="autocompile-toggle__input" />
+          <span class="autocompile-toggle__track" aria-hidden="true"></span>
+          <span class="autocompile-toggle__text">Autocompile</span>
+        </label>
+
+        <p class="counter" id="counter">0 equations compiled</p>
+      </section>
+
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

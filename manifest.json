@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "docslatex",
+  "version": "1.0.0",
+  "description": "Native LaTeX compiling in Google Docs.",
+  "permissions": ["storage"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "docslatex"
+  },
+  "icons": {
+    "16": "logo.png",
+    "32": "logo.png",
+    "48": "logo.png",
+    "128": "logo.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://docs.google.com/document/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["logo.png"],
+      "matches": ["https://docs.google.com/*"]
+    }
+  ]
+}
