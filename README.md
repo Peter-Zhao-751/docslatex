@@ -2,10 +2,14 @@
   <img src="logo.png" alt="docslatex" width="100" />
 </p>
 
-<h1 align="center">docslatex</h1>
+<h1 align="center" style="font-size: 3em;">docslatex</h1>
 
 <p align="center">
   <strong>Native LaTeX math in Google Docs — no images, no servers, no compromises.</strong>
+</p>
+
+<p align="center">
+  <a href="#usage">Usage</a> · <a href="#getting-started">Getting Started</a> · <a href="LICENSE">License</a>
 </p>
 
 ---
@@ -49,6 +53,20 @@ Wrap your LaTeX in delimiters and let docslatex handle the rest:
 3. Click the docslatex icon and hit **Enable**
 4. Write LaTeX between `\( \)` or `\[ \]`
 5. Toggle **Autocompile** for hands-free conversion, or use the compile button
+
+---
+
+## License
+
+MIT — do whatever you want.
+
+## Contributing
+
+PRs welcome. If you find a symbol that doesn't render right, open an issue.
+
+## Acknowledgements
+
+Shoutout to everyone who's ever copy-pasted a screenshot of an equation into a Google Doc and felt bad about it.
 
 ---
 
