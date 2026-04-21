@@ -17,7 +17,13 @@
   "content_scripts": [
     {
       "matches": ["https://docs.google.com/document/*"],
-      "js": ["content.js"],
+      "js": ["highlighter.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://docs.google.com/document/*"],
+      "js": ["compiler.js", "content.js"],
       "run_at": "document_idle"
     }
   ],

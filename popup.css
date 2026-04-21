@@ -538,6 +538,83 @@ body {
   color: var(--green);
 }
 
+/* Debug toggle (upper-right, half the size of autocompile) -------------- */
+.debug-toggle {
+  position: absolute;
+  top: 18px;
+  right: 22px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  z-index: 3;
+}
+
+.debug-toggle__input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
+
+.debug-toggle__track {
+  width: 17px;
+  height: 10px;
+  border-radius: 999px;
+  background: var(--paper-deep);
+  border: 1px solid var(--rule);
+  position: relative;
+  flex-shrink: 0;
+  transition:
+    background 0.35s var(--ease),
+    border-color 0.35s var(--ease),
+    box-shadow 0.35s var(--ease);
+}
+
+.debug-toggle__track::after {
+  content: "";
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ink-faint);
+  transition:
+    transform 0.35s var(--ease),
+    background 0.35s var(--ease);
+}
+
+.debug-toggle__input:checked ~ .debug-toggle__track {
+  background: var(--accent);
+  border-color: var(--accent-deep);
+  box-shadow: 0 0 0 2px var(--accent-glow);
+}
+
+.debug-toggle__input:checked ~ .debug-toggle__track::after {
+  transform: translateX(7px);
+  background: #f1ead8;
+}
+
+.debug-toggle__text {
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  transition: color 0.3s var(--ease);
+  user-select: none;
+}
+
+.debug-toggle:hover .debug-toggle__text {
+  color: var(--ink-soft);
+}
+
+.debug-toggle__input:checked ~ .debug-toggle__text {
+  color: var(--accent);
+}
+
 /* Greeting reveal animation --------------------------------------------- */
 .title__line--accent em {
   position: relative;

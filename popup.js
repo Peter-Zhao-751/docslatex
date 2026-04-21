@@ -4,6 +4,7 @@
   const dateEl = document.getElementById("date");
   const label = btn.querySelector(".btn__label");
   const autocompileInput = document.getElementById("autocompile");
+  const debugInput = document.getElementById("debug");
   const longpressMenu = document.getElementById("longpress-menu");
   const lpWith = document.getElementById("lp-with");
   const lpWithout = document.getElementById("lp-without");
@@ -66,6 +67,7 @@
   // ---------------------------------------------------------------------
   let enabled = false;
   let autocompile = false;
+  let debugMode = false;
   let count = 0;
 
   const renderCounter = () => {
@@ -84,17 +86,35 @@
     autocompileInput.checked = autocompile;
   };
 
+  const renderDebug = () => {
+    debugInput.checked = debugMode;
+  };
+
   // Boot
   store
-    .get({ enabled: false, autocompile: false, equations_compiled: 0 })
-    .then(({ enabled: e, autocompile: a, equations_compiled: n }) => {
-      enabled = !!e;
-      autocompile = !!a;
-      count = Number(n) || 0;
-      renderToggle();
-      renderAutocompile();
-      renderCounter();
-    });
+    .get({
+      enabled: false,
+      autocompile: false,
+      debug_mode: false,
+      equations_compiled: 0,
+    })
+    .then(
+      ({
+        enabled: e,
+        autocompile: a,
+        debug_mode: d,
+        equations_compiled: n,
+      }) => {
+        enabled = !!e;
+        autocompile = !!a;
+        debugMode = !!d;
+        count = Number(n) || 0;
+        renderToggle();
+        renderAutocompile();
+        renderDebug();
+        renderCounter();
+      }
+    );
 
   // ---------------------------------------------------------------------
   // Long-press logic
@@ -191,6 +211,11 @@
     store.set({ autocompile });
   });
 
+  debugInput.addEventListener("change", () => {
+    debugMode = debugInput.checked;
+    store.set({ debug_mode: debugMode });
+  });
+
   // Keep the popup in sync if storage changes elsewhere (e.g. a content
   // script bumps the equation count while the popup is open).
   if (hasChromeStorage && chrome.storage.onChanged) {
@@ -207,6 +232,10 @@
       if (changes.autocompile) {
         autocompile = !!changes.autocompile.newValue;
         renderAutocompile();
+      }
+      if (changes.debug_mode) {
+        debugMode = !!changes.debug_mode.newValue;
+        renderDebug();
       }
     });
   }
