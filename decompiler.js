@@ -329,12 +329,38 @@
     return s;
   }
 
-  const api = { unicodeToLatex };
+  // Quick test used by content.js to decide whether a run of canvas
+  // text is worth offering a Decompile popup on. The bar is low: a
+  // single convertible glyph anywhere in the string is enough. Accent
+  // combining marks never appear on their own, so excluding them here
+  // avoids creating noisy single-combining-char regions.
+  function isDecompileable(ch) {
+    return (
+      SYMBOL_TO_NAME[ch] !== undefined ||
+      SUPER_TO_CHAR[ch] !== undefined ||
+      SUB_TO_CHAR[ch] !== undefined ||
+      MATHBB_INV[ch] !== undefined ||
+      ch === "√"
+    );
+  }
+
+  function hasDecompileable(text) {
+    if (typeof text !== "string") return false;
+    // for..of walks by Unicode codepoint, so surrogate-pair glyphs
+    // like 𝔸 are tested as single chars.
+    for (const ch of text) {
+      if (isDecompileable(ch)) return true;
+    }
+    return false;
+  }
+
+  const api = { unicodeToLatex, hasDecompileable };
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = api;
   } else {
     global.unicodeToLatex = unicodeToLatex;
+    global.hasDecompileable = hasDecompileable;
     global.LatexDecompiler = api;
   }
 })(typeof self !== "undefined" ? self : (typeof globalThis !== "undefined" ? globalThis : this));

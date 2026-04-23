@@ -23,8 +23,14 @@
     },
     {
       "matches": ["https://docs.google.com/document/*"],
-      "js": ["compiler.js", "content.js"],
+      "js": ["compiler.js", "decompiler.js", "content.js"],
       "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://docs.google.com/document/*"],
+      "js": ["test.js"],
+      "run_at": "document_idle",
+      "world": "MAIN"
     }
   ],
   "web_accessible_resources": [

@@ -35,18 +35,49 @@
   const GREEN_BG_HOVER = "rgba(46, 125, 50, 0.34)";
   const GREEN_BORDER_HOVER = "#2e7d32";
 
+  // Purple palette for "decompile" regions — runs of Unicode math
+  // glyphs (α, β, ², ₁, ⊂, →, 𝔸, …) that we can round-trip back to
+  // LaTeX source. Same pattern as green: underline always visible,
+  // background tint only in debug mode, darker shade when the region
+  // is the current hover target.
+  const PURPLE_BG = "rgba(156, 39, 176, 0.14)";
+  const PURPLE_BORDER = "#9c27b0";
+  const PURPLE_BG_HOVER = "rgba(106, 27, 154, 0.34)";
+  const PURPLE_BORDER_HOVER = "#6a1b9a";
+
+  // Picks the right palette for a region based on its .type. Keeps
+  // paintRegion and populateMarks from sprouting parallel if/else
+  // trees everywhere we need a color.
+  function regionPalette(region) {
+    if (region && region.type === "decompile") {
+      return {
+        bg: PURPLE_BG,
+        border: PURPLE_BORDER,
+        bgHover: PURPLE_BG_HOVER,
+        borderHover: PURPLE_BORDER_HOVER,
+      };
+    }
+    return {
+      bg: GREEN_BG,
+      border: GREEN_BORDER,
+      bgHover: GREEN_BG_HOVER,
+      borderHover: GREEN_BORDER_HOVER,
+    };
+  }
+
   function paintRegion(region, hovered) {
     if (!region || !region.marks) return;
+    const p = regionPalette(region);
     let bg, border;
     if (hovered) {
       // Caret-touched: dark underline always; dark highlight only in
       // debug mode.
-      border = GREEN_BORDER_HOVER;
-      bg = debugMode ? GREEN_BG_HOVER : "transparent";
+      border = p.borderHover;
+      bg = debugMode ? p.bgHover : "transparent";
     } else {
       // Not touched: underline always visible; highlight only in debug.
-      border = GREEN_BORDER;
-      bg = debugMode ? GREEN_BG : "transparent";
+      border = p.border;
+      bg = debugMode ? p.bg : "transparent";
     }
     for (const mark of region.marks) {
       if (!mark) continue;
@@ -55,11 +86,1594 @@
     }
   }
 
-  function compileText(latex) {
-    if (typeof window.latexToUnicode === "function") {
-      return window.latexToUnicode(latex);
+  // Rich compile: produces either a plain Unicode string or a structured
+  // { kind: "fraction" | "matrix", ... } object that the paste path turns
+  // into a native Docs table via text/html.
+  function compileRich(latex) {
+    if (typeof window.latexToRich === "function") {
+      return window.latexToRich(latex);
     }
-    return latex;
+    if (typeof window.latexToUnicode === "function") {
+      return { kind: "text", value: window.latexToUnicode(latex) };
+    }
+    return { kind: "text", value: latex };
+  }
+
+  // Canvas scratch for width measurement. Font is set fresh per render
+  // call so measurements track the final cell font size.
+  const richScratch = document.createElement("canvas").getContext("2d");
+  const richMeasure = (text) =>
+    Math.ceil(richScratch.measureText(String(text)).width);
+
+  // Content may now include HTML like "a<sub>b</sub>c". Canvas can't
+  // measure that directly — strip tags first and measure the visible
+  // text. Subscripts/superscripts render narrower than full-size glyphs,
+  // so the stripped-text measurement slightly overestimates the true
+  // width, which errs on the side of "cell is a bit wider" rather than
+  // "text wraps".
+  const stripHTMLTags = (s) => String(s).replace(/<[^>]*>/g, "");
+
+  // CSS points → CSS pixels at the standard 96 DPI web resolution.
+  // Canvas measureText returns CSS pixels when font is set in pt, so
+  // this is the conversion we need when we combine a pt-based padding
+  // budget with a px-based content width.
+  const PT_TO_PX = 96 / 72;
+
+  // Safety slack in ems for cells whose neighbors aren't adjacent
+  // math content. Canvas measureText reports widths in *our*
+  // browser's Arial; after paste, Docs renders with a slightly
+  // different font stack, so real widths can drift a few percent
+  // wider than measured. Matrix and text cells absorb that drift
+  // with this budget.
+  const CELL_SAFETY_EM = 0.15;
+
+  // Total horizontal padding per side of each cell kind. Fraction
+  // cells are tighter than the others — the bar ends nearly flush
+  // with the widest digit, which reads cleanest for inline math.
+  const FRAC_SIDE_PAD_EM = 0.075;
+  // Matrix has two spacing knobs the other structures don't need:
+  //
+  // MATRIX_SIDE_PAD_EM — horizontal slack inside each matrix column
+  // cell. Multi-char content with superscripts (`-2a`, `3a^2`) renders
+  // a hair wider in Docs than it measures on the Arial scratch canvas,
+  // so the column pad is ~1.3× the baseline 0.25em to keep content
+  // inside its cell without collisions.
+  const MATRIX_SIDE_PAD_EM = 0.325;
+  // MATRIX_TEXT_SIBLING_PAD_EM — slack around a text cell that sits
+  // directly next to a matrix (or a cases block). Zero would leave the
+  // `+`/`=` glyph touching the bracket/brace, which reads cramped;
+  // this tiny pad unsticks them without introducing an obvious gutter.
+  // Non-matrix sequences stick with SEQ_TEXT_PAD_EM (=0) since their
+  // text sits next to a fraction bar / open space, not a bracket edge.
+  const MATRIX_TEXT_SIBLING_PAD_EM = 0.08;
+  const TEXT_SIDE_PAD_EM = 0.15 + CELL_SAFETY_EM;
+  // Text cells in any sequence builder are measured to their exact
+  // rendered width — no side slack. Keeps text flush against adjacent
+  // structural blocks (matrix bracket, fraction bar, cases brace) and
+  // matches what structural cells do (parseW → inner table's declared
+  // width, no extra), so every cell type follows the same "natural
+  // width" rule instead of each kind having its own gutter constant.
+  const SEQ_TEXT_PAD_EM = 0;
+
+  // Font-family pinned on every cell we emit. Measurements happen in
+  // Arial on our scratch canvas, so forcing the rendered font to Arial
+  // keeps Docs' actual layout in lockstep with our predicted widths.
+  const CELL_FONT_FAMILY = "Arial,sans-serif";
+
+  // Rendered math renders at the same size as the surrounding text.
+  const SIZE_FACTOR = 1.0;
+
+  // When Debug is on in the popup, every cell we emit draws a dashed
+  // outline so we can see what Docs' paste importer actually keeps
+  // (widths, cell boundaries, rowspan) vs. flattens. Color-coded by
+  // role:
+  //   cyan   — sequence text cell (rowspan=2 across num/den rows)
+  //   red    — fraction num/den cell (standalone or in a sequence)
+  //   orange — matrix cell
+  const dbg = (color) =>
+    debugMode ? `border:1px dashed ${color};` : `border:0;`;
+
+  function setRichFont(pt) {
+    richScratch.font = pt + "pt Arial, sans-serif";
+  }
+
+  // Inline <span>, not <p>: Docs treats pasted <p> as a full paragraph
+  // and stacks its own before/after paragraph spacing on top of our
+  // margin:0, which was inflating row height. A <span> is inline-only
+  // and doesn't trigger paragraph formatting on paste. Horizontal
+  // centering now falls to the cell's align="center" attribute.
+  function richPara(pt, c) {
+    return (
+      `<span style="font-size:${pt}pt;line-height:1;">` +
+      c +
+      `</span>`
+    );
+  }
+
+  function resolveRenderPt(sourcePt) {
+    return Math.max(4, (sourcePt || 11) * SIZE_FACTOR);
+  }
+
+  // Cell width calculation, one place for everyone.
+  //
+  // Content is measured on the Arial scratch canvas at the exact pt
+  // we'll render at, so contentPx is the true rendered width in CSS
+  // pixels. The slack is a font-proportional em value converted to
+  // CSS pixels (side-padding × 2 for both sides). No magic
+  // multipliers — if measurement and render fonts match, the cell is
+  // exactly wide enough for the content plus the requested gutter.
+  function cellWidthPx(contentPx, pt, sidePadEm) {
+    return Math.ceil(contentPx + pt * PT_TO_PX * sidePadEm * 2);
+  }
+
+  // Shared style for a cell that renders math at `pt`. Font-family
+  // and font-size are pinned ON THE <td> (not just the inner <span>)
+  // because Docs' paste importer is liberal about stripping styles
+  // from inline elements inside cells — without an explicit cell
+  // font-size, content can end up rendering at the cursor paragraph's
+  // default size (11pt or whatever heading is active) instead of the
+  // 7pt we intended. line-height:1 + padding:0 keeps the row height
+  // tight. text-align:center in CSS (not just align="center" on the
+  // <td>) because Docs respects the CSS property but frequently drops
+  // the legacy HTML attribute.
+  function mathCellStyle(pt, debugColor, textAlign) {
+    return (
+      `padding:0 !important;` +
+      `border:none;` +
+      `line-height:1;` +
+      `white-space:nowrap;` +
+      `text-align:${textAlign || "center"};` +
+      `vertical-align:middle;` +
+      `font-family:${CELL_FONT_FAMILY};` +
+      `font-size:${pt}pt;` +
+      `font-weight:normal;` +
+      dbg(debugColor)
+    );
+  }
+
+  // The inner fraction table (no <meta>, no outer wrapper) so it can
+  // be reused verbatim both as a top-level paste and as a nested cell
+  // inside a sequence's outer row.
+  //
+  // numHTML/denHTML may contain native <sub>/<sup> tags; we strip
+  // them for measurement but pass them through as cell content so
+  // Docs' paste importer picks up the subscript/superscript formatting.
+  function buildFractionInnerHTML(numHTML, denHTML, pt) {
+    setRichFont(pt);
+    const contentPx = Math.max(
+      richMeasure(stripHTMLTags(numHTML)),
+      richMeasure(stripHTMLTags(denHTML))
+    );
+    const w = cellWidthPx(contentPx, pt, FRAC_SIDE_PAD_EM);
+    const baseStyle = mathCellStyle(pt, "#f00");
+    const cell = (c, rule) =>
+      `<td align="center" width="${w}" height="1" style="${baseStyle}` +
+      (rule ? "border-top:0.75pt solid #000;" : "") +
+      `">${richPara(pt, c)}</td>`;
+    // Table width pinned explicitly to the cell width (both the HTML
+    // attribute and the CSS property). The previous `width:1px`
+    // shrink-to-fit trick works in a normal browser but Docs' paste
+    // importer honored the `1px` literally — the table collapsed to
+    // 1px and Docs char-broke the numerator ("324" → "32" / "4") to
+    // fit. The sequence path has always pinned the outer table to
+    // `totalW` for this reason.
+    return (
+      `<table width="${w}" style="border-collapse:collapse;border:none;` +
+      `table-layout:auto;width:${w}px;">` +
+      `<tr>${cell(numHTML, false)}</tr>` +
+      `<tr>${cell(denHTML, true)}</tr>` +
+      `</table>`
+    );
+  }
+
+  function buildFractionHTML(numHTML, denHTML, sourcePt) {
+    const pt = resolveRenderPt(sourcePt);
+    return `<meta charset="utf-8">${buildFractionInnerHTML(numHTML, denHTML, pt)}`;
+  }
+
+  // Binomial coefficient `\binom{n}{k}` / `{n \choose k}`: a 3-col ×
+  // 2-row table. Column 0 and column 2 are rowspan=2 cells holding an
+  // enlarged `(` / `)`; column 1 splits into num (row 1) and den (row
+  // 2) — same cell pair as a fraction, minus the dividing rule. No
+  // visible borders anywhere.
+  //
+  // The paren font-size is bumped so the glyph reads as a bracket
+  // enclosing both rows rather than a normal-sized character
+  // centered between them. 1.9× the body pt lands close to what
+  // LaTeX's `\big(` does visually without a dedicated extensible
+  // glyph.
+  function buildChooseHTML(numHTML, denHTML, sourcePt) {
+    const pt = resolveRenderPt(sourcePt);
+    setRichFont(pt);
+    const contentPx = Math.max(
+      richMeasure(stripHTMLTags(numHTML)),
+      richMeasure(stripHTMLTags(denHTML))
+    );
+    const w = cellWidthPx(contentPx, pt, FRAC_SIDE_PAD_EM);
+    const contentStyle = mathCellStyle(pt, "#f0f");
+    const contentCell = (c) =>
+      `<td align="center" width="${w}" height="1" style="${contentStyle}">` +
+      richPara(pt, c) +
+      `</td>`;
+
+    const parenPt = pt * 1.9;
+    const parenStyle =
+      `padding:0 !important;border:none;line-height:1;white-space:nowrap;` +
+      `text-align:center;vertical-align:middle;` +
+      `font-family:${CELL_FONT_FAMILY};` +
+      `font-size:${parenPt}pt;font-weight:normal;` +
+      dbg("#f0f");
+    // Measure both glyphs — `(` and `)` can differ by a pixel or two in
+    // any given font, and Docs sometimes honors width on one rowspan
+    // cell but not the other if the glyph it contains happens to fit
+    // below the declared width. Taking max + a small em-based slack
+    // makes the declared width visibly wider than either glyph so Docs
+    // can't shrink either column.
+    setRichFont(parenPt);
+    const parenGlyphPx = Math.max(richMeasure("("), richMeasure(")"));
+    const parenW = cellWidthPx(parenGlyphPx, parenPt, 0.0);
+    const parenCell = (ch) =>
+      `<td rowspan="2" valign="middle" align="center" width="${parenW}" ` +
+      `style="${parenStyle}">` +
+      `<span style="font-size:${parenPt}pt;line-height:1;">${ch}</span>` +
+      `</td>`;
+
+    const totalW = parenW * 2 + w;
+    return (
+      `<meta charset="utf-8">` +
+      `<table width="${totalW}" style="border-collapse:collapse;border:none;` +
+      `table-layout:fixed;width:${totalW}px;">` +
+      `<tr>${parenCell("(")}${contentCell(numHTML)}${parenCell(")")}</tr>` +
+      `<tr>${contentCell(denHTML)}</tr>` +
+      `</table>`
+    );
+  }
+
+  // Inline renderer for a single matrix/cases cell that may contain a
+  // mix of text, \frac, and \binom parts. Returns `{ html, width,
+  // structural }`:
+  //   - `structural === false`: cell is pure text; `html` is a string
+  //     of valueHTML parts and the outer cell can wrap it in richPara.
+  //   - `structural === true`: cell has at least one \frac or \binom;
+  //     `html` is a complete <table> — a flat 2-row mini-grid where
+  //     text parts span both rows and fraction/choose parts split into
+  //     top/bottom halves. The outer cell must emit this html directly,
+  //     not wrapped in richPara/<span> (invalid to put <table> inside
+  //     <span>).
+  function buildCellInner(parts, pt) {
+    if (!parts || !parts.length) {
+      return { html: "", width: 0, structural: false };
+    }
+    const hasStructure = parts.some(
+      (p) => p.kind === "fraction" || p.kind === "choose"
+    );
+    if (!hasStructure) {
+      setRichFont(pt);
+      let html = "";
+      let plain = "";
+      for (const p of parts) {
+        let v = "";
+        let plainV = "";
+        if (p.kind === "text") {
+          v = p.valueHTML || p.value || "";
+          plainV = p.value || "";
+        } else if (p.kind === "sqrt") {
+          const c = p.contentHTML || p.content || "";
+          v = "√(" + c + ")";
+          plainV = "√(" + (p.content || "") + ")";
+        }
+        html += v;
+        plain += plainV;
+      }
+      return { html, width: richMeasure(plain), structural: false };
+    }
+
+    const topCells = [];
+    const bottomCells = [];
+    let totalW = 0;
+    for (const part of parts) {
+      if (part.kind === "text") {
+        const valueHTML = part.valueHTML || part.value || "";
+        if (!valueHTML) continue;
+        setRichFont(pt);
+        const w = cellWidthPx(
+          richMeasure(stripHTMLTags(valueHTML)),
+          pt,
+          TEXT_SIDE_PAD_EM
+        );
+        totalW += w;
+        const style =
+          `padding:0 !important;border:none;white-space:nowrap;` +
+          `line-height:1.15;text-align:center;vertical-align:middle;` +
+          `font-family:${CELL_FONT_FAMILY};font-size:${pt}pt;` +
+          `font-weight:normal;${dbg("#0cc")}`;
+        topCells.push(
+          `<td rowspan="2" valign="middle" align="center" width="${w}" ` +
+          `height="1" style="${style}">${valueHTML}</td>`
+        );
+      } else if (part.kind === "sqrt") {
+        const contentHTML = part.contentHTML || part.content || "";
+        const v = "√(" + contentHTML + ")";
+        setRichFont(pt);
+        const w = cellWidthPx(
+          richMeasure(stripHTMLTags(v)),
+          pt,
+          TEXT_SIDE_PAD_EM
+        );
+        totalW += w;
+        const style =
+          `padding:0 !important;border:none;white-space:nowrap;` +
+          `line-height:1.15;text-align:center;vertical-align:middle;` +
+          `font-family:${CELL_FONT_FAMILY};font-size:${pt}pt;` +
+          `font-weight:normal;${dbg("#0cc")}`;
+        topCells.push(
+          `<td rowspan="2" valign="middle" align="center" width="${w}" ` +
+          `height="1" style="${style}">${v}</td>`
+        );
+      } else if (part.kind === "fraction") {
+        const numHTML = part.numHTML || part.num;
+        const denHTML = part.denHTML || part.den;
+        setRichFont(pt);
+        const contentPx = Math.max(
+          richMeasure(stripHTMLTags(numHTML)),
+          richMeasure(stripHTMLTags(denHTML))
+        );
+        const w = cellWidthPx(contentPx, pt, FRAC_SIDE_PAD_EM);
+        totalW += w;
+        const numStyle = mathCellStyle(pt, "#f00");
+        const denStyle =
+          mathCellStyle(pt, "#f00") + "border-top:0.75pt solid #000;";
+        topCells.push(
+          `<td align="center" width="${w}" height="1" style="${numStyle}">` +
+          numHTML + `</td>`
+        );
+        bottomCells.push(
+          `<td align="center" width="${w}" height="1" style="${denStyle}">` +
+          denHTML + `</td>`
+        );
+      } else if (part.kind === "choose") {
+        const numHTML = part.numHTML || part.num;
+        const denHTML = part.denHTML || part.den;
+        setRichFont(pt);
+        const contentPx = Math.max(
+          richMeasure(stripHTMLTags(numHTML)),
+          richMeasure(stripHTMLTags(denHTML))
+        );
+        const contentW = cellWidthPx(contentPx, pt, FRAC_SIDE_PAD_EM);
+        const parenPt = pt * 1.9;
+        setRichFont(parenPt);
+        const parenGlyphPx = Math.max(richMeasure("("), richMeasure(")"));
+        const parenW = cellWidthPx(parenGlyphPx, parenPt, 0.05);
+        totalW += parenW * 2 + contentW;
+        const contentStyle = mathCellStyle(pt, "#f0f");
+        const parenStyle =
+          `padding:0 !important;border:none;line-height:1;` +
+          `white-space:nowrap;text-align:center;vertical-align:middle;` +
+          `font-family:${CELL_FONT_FAMILY};font-size:${parenPt}pt;` +
+          `font-weight:normal;${dbg("#f0f")}`;
+        topCells.push(
+          `<td rowspan="2" valign="middle" align="center" width="${parenW}" ` +
+          `style="${parenStyle}">` +
+          `<span style="font-size:${parenPt}pt;line-height:1;">(</span></td>` +
+          `<td align="center" width="${contentW}" height="1" style="${contentStyle}">` +
+          numHTML + `</td>` +
+          `<td rowspan="2" valign="middle" align="center" width="${parenW}" ` +
+          `style="${parenStyle}">` +
+          `<span style="font-size:${parenPt}pt;line-height:1;">)</span></td>`
+        );
+        bottomCells.push(
+          `<td align="center" width="${contentW}" height="1" style="${contentStyle}">` +
+          denHTML + `</td>`
+        );
+      }
+    }
+
+    const html =
+      `<table width="${totalW}" style="border-collapse:collapse;border:none;` +
+      `table-layout:fixed;width:${totalW}px;">` +
+      `<tr>${topCells.join("")}</tr>` +
+      `<tr>${bottomCells.join("")}</tr>` +
+      `</table>`;
+    return { html, width: totalW, structural: true };
+  }
+
+  // Proper M×N table: one <tr> per matrix row, one <td> per column
+  // in that row. "plain" renders without brackets; every other style
+  // gets a thin bracket cell on the left and right of every row, with
+  // top/bottom borders on the first/last row to form the corner ticks
+  // of a `[` / `]`. (CSS-based parens/braces don't survive Docs' paste
+  // importer, so [] stands in for all delimited variants for now.)
+  //
+  // rowsHTML carries the same grid but with native <sub>/<sup> tags
+  // baked in where a cell had `_`/`^`; rows (Unicode-only) is used
+  // for width measurement since Canvas can't measure HTML.
+  function buildMatrixHTML(rows, style, sourcePt, rowsHTML, rowsParts) {
+    if (!Array.isArray(rows) || !rows.length) return "";
+    const rowCount = rows.length;
+    const cols = Math.max(...rows.map((r) => (r ? r.length : 0)));
+    if (!cols) return "";
+
+    const pt = resolveRenderPt(sourcePt);
+    setRichFont(pt);
+
+    const useHTML = Array.isArray(rowsHTML) && rowsHTML.length === rowCount;
+    const useParts = Array.isArray(rowsParts) && rowsParts.length === rowCount;
+    const cellHTML = (r, c) => {
+      if (useHTML && rowsHTML[r] && rowsHTML[r][c] != null) return rowsHTML[r][c];
+      return rows[r] && rows[r][c] != null ? rows[r][c] : "";
+    };
+    const cellPlain = (r, c) =>
+      rows[r] && rows[r][c] != null ? rows[r][c] : "";
+    const cellParts = (r, c) =>
+      useParts && rowsParts[r] && rowsParts[r][c] ? rowsParts[r][c] : null;
+
+    // Pre-render each cell. Structural cells (contain \frac/\binom)
+    // come back as a nested <table>; plain cells come back as a text
+    // string that still needs richPara wrapping.
+    const cellInner = [];
+    for (let r = 0; r < rowCount; r++) {
+      const row = [];
+      for (let c = 0; c < cols; c++) {
+        const parts = cellParts(r, c);
+        if (parts) {
+          row.push(buildCellInner(parts, pt));
+        } else {
+          row.push({ html: cellHTML(r, c), width: richMeasure(cellPlain(r, c)), structural: false });
+        }
+      }
+      cellInner.push(row);
+    }
+
+    const columnWidths = [];
+    for (let c = 0; c < cols; c++) {
+      let maxW = 0;
+      for (let r = 0; r < rowCount; r++) {
+        const inner = cellInner[r][c];
+        const w = inner.structural
+          ? inner.width
+          : cellWidthPx(inner.width, pt, MATRIX_SIDE_PAD_EM);
+        maxW = Math.max(maxW, w);
+      }
+      columnWidths.push(maxW);
+    }
+
+    const matrixCellStyle = mathCellStyle(pt, "#fa0");
+    const bracketed = style !== "plain";
+    const BRACKET = "1.25pt solid #000";
+    const BRACKET_CELL_W = 3;
+
+    // Left/right bracket cells: left/right border on every row (those
+    // collapse into one continuous vertical stroke under
+    // border-collapse), plus top/bottom borders only on the first and
+    // last rows so the corners read as `[` / `]` ticks rather than a
+    // closed rectangle. vmatrix ("bar") renders vertical strokes only
+    // — no corner ticks — so the style reads as `|…|` rather than `[…]`.
+    const isBar = style === "bar" || style === "doublebar";
+    const bracketCellStyle = (r, side) => {
+      let s =
+        `padding:0 !important;` +
+        `line-height:1;` +
+        `font-size:${pt}pt;` +
+        (side === "L"
+          ? `border-left:${BRACKET};border-right:0;`
+          : `border-right:${BRACKET};border-left:0;`) +
+        (r === 0 && !isBar ? `border-top:${BRACKET};` : `border-top:0;`) +
+        (r === rowCount - 1 && !isBar
+          ? `border-bottom:${BRACKET};`
+          : `border-bottom:0;`);
+      return s;
+    };
+
+    const trHTML = [];
+    for (let r = 0; r < rowCount; r++) {
+      const tds = [];
+      if (bracketed) {
+        tds.push(
+          `<td width="${BRACKET_CELL_W}" style="${bracketCellStyle(r, "L")}">&nbsp;</td>`
+        );
+      }
+      for (let c = 0; c < cols; c++) {
+        const inner = cellInner[r][c];
+        const content = inner.structural ? inner.html : richPara(pt, inner.html);
+        tds.push(
+          `<td width="${columnWidths[c]}" style="${matrixCellStyle}">` +
+          content + `</td>`
+        );
+      }
+      if (bracketed) {
+        tds.push(
+          `<td width="${BRACKET_CELL_W}" style="${bracketCellStyle(r, "R")}">&nbsp;</td>`
+        );
+      }
+      trHTML.push(`<tr>${tds.join("")}</tr>`);
+    }
+
+    // Pin the table to exactly the sum of its cell widths, same
+    // defense against Docs stretching as the fraction/sequence paths.
+    // Matrix tables specifically come out ~2px narrower than their
+    // actual render — the per-row bracket borders (left/right 1.25pt
+    // each, collapsed to a ~1px stroke) sit *on* the cell edge and eat
+    // into the declared width, and Docs' importer appears to trim
+    // another pixel off the right edge of bracketed tables on paste.
+    // Everywhere else the inner tables have no outer border, so this
+    // +2 is matrix-only. Without it, the right bracket gets clipped.
+    const totalW =
+      columnWidths.reduce((a, b) => a + b, 0) +
+      (bracketed ? BRACKET_CELL_W * 2 : 0) +
+      (bracketed ? 2 : 0);
+
+    return (
+      `<meta charset="utf-8">` +
+      `<table width="${totalW}" style="border-collapse:collapse;` +
+      `width:${totalW}px;">` +
+      trHTML.join("") +
+      `</table>`
+    );
+  }
+
+  // `cases`: a left-brace wrapper around rows of left-aligned content.
+  // Renders as a 2-column table: col 0 is a single rowspan=N cell
+  // holding an oversized `{` glyph, col 1 stacks the row contents
+  // one per row, left-aligned. Multi-column row bodies (the `&` in
+  // `a & x > 0`) get joined with a wide gap in the single content
+  // cell so the whole row reads naturally.
+  // Decompose a cell's parts into a flat set of cell descriptors for
+  // the two outer rows (top + optional bottom). Returned cells are raw
+  // structs (not HTML strings) so the caller can stitch them into a
+  // bigger table with the correct rowspans based on whether ANY row in
+  // that bigger table has structure. Each cell:
+  //   { html, width, style, align, rowspanStructural, isTop, isBottom }
+  // rowspanStructural === 2 means "becomes rowspan=2 when any other
+  // row has structure, otherwise rowspan=1".
+  function buildValueSection(parts, pt) {
+    const topCells = [];
+    const bottomCells = [];
+    let hasStructure = false;
+    let totalW = 0;
+
+    for (const part of parts) {
+      if (!part) continue;
+      if (part.kind === "text") {
+        const valueHTML = part.valueHTML || part.value || "";
+        if (!valueHTML) continue;
+        setRichFont(pt);
+        const w = cellWidthPx(
+          richMeasure(stripHTMLTags(valueHTML)),
+          pt,
+          TEXT_SIDE_PAD_EM
+        );
+        totalW += w;
+        const style =
+          `padding:0 !important;border:none;white-space:nowrap;` +
+          `line-height:1.15;text-align:left;vertical-align:middle;` +
+          `font-family:${CELL_FONT_FAMILY};font-size:${pt}pt;` +
+          `font-weight:normal;${dbg("#0cc")}`;
+        topCells.push({
+          html: richPara(pt, valueHTML),
+          width: w,
+          style,
+          align: "left",
+          rowspanStructural: 2,
+        });
+      } else if (part.kind === "sqrt") {
+        const contentHTML = part.contentHTML || part.content || "";
+        const v = "√(" + contentHTML + ")";
+        setRichFont(pt);
+        const w = cellWidthPx(
+          richMeasure(stripHTMLTags(v)),
+          pt,
+          TEXT_SIDE_PAD_EM
+        );
+        totalW += w;
+        const style =
+          `padding:0 !important;border:none;white-space:nowrap;` +
+          `line-height:1.15;text-align:left;vertical-align:middle;` +
+          `font-family:${CELL_FONT_FAMILY};font-size:${pt}pt;` +
+          `font-weight:normal;${dbg("#0cc")}`;
+        topCells.push({
+          html: richPara(pt, v),
+          width: w,
+          style,
+          align: "left",
+          rowspanStructural: 2,
+        });
+      } else if (part.kind === "fraction") {
+        hasStructure = true;
+        const numHTML = part.numHTML || part.num;
+        const denHTML = part.denHTML || part.den;
+        setRichFont(pt);
+        const w = cellWidthPx(
+          Math.max(
+            richMeasure(stripHTMLTags(numHTML)),
+            richMeasure(stripHTMLTags(denHTML))
+          ),
+          pt,
+          FRAC_SIDE_PAD_EM
+        );
+        totalW += w;
+        const numStyle = mathCellStyle(pt, "#f00");
+        const denStyle =
+          mathCellStyle(pt, "#f00") + "border-top:0.75pt solid #000;";
+        topCells.push({
+          html: richPara(pt, numHTML),
+          width: w,
+          style: numStyle,
+          align: "center",
+          rowspanStructural: 1,
+        });
+        bottomCells.push({
+          html: richPara(pt, denHTML),
+          width: w,
+          style: denStyle,
+          align: "center",
+        });
+      } else if (part.kind === "choose") {
+        hasStructure = true;
+        const numHTML = part.numHTML || part.num;
+        const denHTML = part.denHTML || part.den;
+        setRichFont(pt);
+        const contentW = cellWidthPx(
+          Math.max(
+            richMeasure(stripHTMLTags(numHTML)),
+            richMeasure(stripHTMLTags(denHTML))
+          ),
+          pt,
+          FRAC_SIDE_PAD_EM
+        );
+        const parenPt = pt * 1.9;
+        setRichFont(parenPt);
+        const parenGlyphPx = Math.max(richMeasure("("), richMeasure(")"));
+        const parenW = cellWidthPx(parenGlyphPx, parenPt, 0.05);
+        totalW += parenW * 2 + contentW;
+        const contentStyle = mathCellStyle(pt, "#f0f");
+        const parenStyle =
+          `padding:0 !important;border:none;line-height:1;` +
+          `white-space:nowrap;text-align:center;vertical-align:middle;` +
+          `font-family:${CELL_FONT_FAMILY};font-size:${parenPt}pt;` +
+          `font-weight:normal;${dbg("#f0f")}`;
+        topCells.push({
+          html: `<span style="font-size:${parenPt}pt;line-height:1;">(</span>`,
+          width: parenW,
+          style: parenStyle,
+          align: "center",
+          rowspanStructural: 2,
+        });
+        topCells.push({
+          html: richPara(pt, numHTML),
+          width: contentW,
+          style: contentStyle,
+          align: "center",
+          rowspanStructural: 1,
+        });
+        topCells.push({
+          html: `<span style="font-size:${parenPt}pt;line-height:1;">)</span>`,
+          width: parenW,
+          style: parenStyle,
+          align: "center",
+          rowspanStructural: 2,
+        });
+        bottomCells.push({
+          html: richPara(pt, denHTML),
+          width: contentW,
+          style: contentStyle,
+          align: "center",
+        });
+      }
+    }
+
+    return { topCells, bottomCells, hasStructure, totalW };
+  }
+
+  // `cases`: fully flat table. brace | value sub-cells | condition.
+  // Each cases-row expands to 1 outer row (if text-only) or 2 outer
+  // rows (if it has a fraction/choose). We deliberately avoid nesting
+  // a sub-table inside a cell because Docs' paste importer sometimes
+  // flattens nested tables back into the outer one, which scrambles
+  // column alignment across rows.
+  function buildCasesHTML(rows, sourcePt, rowsHTML, rowsParts) {
+    if (!Array.isArray(rows) || !rows.length) return "";
+    const rowCount = rows.length;
+    const pt = resolveRenderPt(sourcePt);
+    setRichFont(pt);
+
+    const useHTML = Array.isArray(rowsHTML) && rowsHTML.length === rowCount;
+    const useParts = Array.isArray(rowsParts) && rowsParts.length === rowCount;
+    const cellHTML = (r, c) => {
+      const source = useHTML ? rowsHTML[r] : rows[r];
+      if (!Array.isArray(source)) return "";
+      const v = source[c];
+      return v != null ? String(v) : "";
+    };
+    const cellPlain = (r, c) => {
+      const source = rows[r];
+      if (!Array.isArray(source)) return "";
+      const v = source[c];
+      return v != null ? String(v) : "";
+    };
+    const cellParts = (r, c) =>
+      useParts && rowsParts[r] && rowsParts[r][c] ? rowsParts[r][c] : null;
+
+    // Per cases-row, decompose value into top/bottom cell lists.
+    const sections = [];
+    for (let r = 0; r < rowCount; r++) {
+      const parts = cellParts(r, 0);
+      const effectiveParts =
+        parts && parts.length
+          ? parts
+          : [
+              {
+                kind: "text",
+                valueHTML: cellHTML(r, 0),
+                value: cellPlain(r, 0),
+              },
+            ];
+      sections.push(buildValueSection(effectiveParts, pt));
+    }
+    const anyStructure = sections.some((s) => s.hasStructure);
+
+    // Value region total width = max across rows (each row's totalW).
+    // And max column count across rows — rows with fewer subcells
+    // will use colspan on a padding cell to reach this count, so every
+    // row's condition lands in the same final column regardless of how
+    // structurally wide that row's value is.
+    let valueW = 0;
+    let maxValueCols = 0;
+    for (const s of sections) {
+      if (s.totalW > valueW) valueW = s.totalW;
+      if (s.topCells.length > maxValueCols) maxValueCols = s.topCells.length;
+    }
+
+    // Conditions — keep simple, text-only fallback (no nested tables
+    // used here; conditions rarely contain structure in practice).
+    const condParts = [];
+    let condW = 0;
+    for (let r = 0; r < rowCount; r++) {
+      const cParts = cellParts(r, 1);
+      if (cParts && cParts.length) {
+        const sec = buildValueSection(cParts, pt);
+        // Flatten section's top cells into a single HTML run (no
+        // structural conditions supported).
+        const html = sec.topCells.map((c) => c.html).join("");
+        const w = sec.totalW;
+        condParts.push({ html, width: w, style: null });
+        if (w > condW) condW = w;
+      } else {
+        const html = cellHTML(r, 1);
+        const plain = cellPlain(r, 1);
+        if (!html) {
+          condParts.push({ html: "", width: 0, style: null });
+          continue;
+        }
+        setRichFont(pt);
+        const w = cellWidthPx(
+          richMeasure(stripHTMLTags(html)),
+          pt,
+          MATRIX_SIDE_PAD_EM
+        );
+        condParts.push({ html: richPara(pt, html), width: w, style: null });
+        if (w > condW) condW = w;
+      }
+    }
+    if (!condParts.some((c) => c.html && c.html.length > 0)) condW = 0;
+
+    // Total outer rows = sum of per-section outer rows (1 or 2).
+    let totalOuterRows = 0;
+    for (const s of sections) totalOuterRows += s.hasStructure ? 2 : 1;
+
+    // Oversized brace. 1.1× per outer row is a reasonable height.
+    const bracePt = Math.max(pt * 1.8, pt * totalOuterRows * 1.1);
+    setRichFont(bracePt);
+    const braceW = cellWidthPx(richMeasure("{"), bracePt, 0);
+
+    const braceStyle =
+      `padding:0 !important;border:none;line-height:1;white-space:nowrap;` +
+      `text-align:center;vertical-align:middle;` +
+      `font-family:${CELL_FONT_FAMILY};` +
+      `font-size:${bracePt}pt;font-weight:normal;` +
+      dbg("#fa0");
+    const condStyle = mathCellStyle(pt, "#fa0", "left");
+
+    const tdHTML = (cell, rowspan) => {
+      const rs = rowspan > 1 ? ` rowspan="${rowspan}"` : "";
+      return (
+        `<td${rs} valign="middle" align="${cell.align || "left"}" ` +
+        `width="${cell.width}" style="${cell.style}">${cell.html}</td>`
+      );
+    };
+
+    const trHTML = [];
+    for (let r = 0; r < rowCount; r++) {
+      const s = sections[r];
+      const rowOuterCount = s.hasStructure ? 2 : 1;
+      // Structural: frac/choose parent cells want rowspan=1, text/parens
+      // inside a structural row want rowspan=2. For a non-structural
+      // row (text-only), cells use rowspan=1 (the row itself only
+      // spans 1 outer row).
+      const cellRowspan = (c) => {
+        if (!s.hasStructure) return 1;
+        return c.rowspanStructural || 1;
+      };
+
+      // TOP row
+      const topTDs = [];
+      if (r === 0) {
+        topTDs.push(
+          `<td rowspan="${totalOuterRows}" valign="middle" align="center" ` +
+          `width="${braceW}" style="${braceStyle}">` +
+          `<span style="font-size:${bracePt}pt;line-height:1;">{</span>` +
+          `</td>`
+        );
+      }
+      for (const cell of s.topCells) {
+        topTDs.push(tdHTML(cell, cellRowspan(cell)));
+      }
+      // Padding cell: if this row's value has fewer sub-columns than
+      // the widest row, a pad cell with colspan=(maxValueCols - N)
+      // fills the missing columns so the condition lands at the same
+      // final column across all rows. Width absorbs any remaining
+      // pixel slack (valueW - s.totalW). No debug outline so the pad
+      // reads as whitespace, not a cell.
+      const padColspan = maxValueCols - s.topCells.length;
+      if (padColspan > 0) {
+        const padW = Math.max(0, valueW - s.totalW);
+        topTDs.push(
+          `<td rowspan="${rowOuterCount}" colspan="${padColspan}" ` +
+          `width="${padW}" style="padding:0;border:none;"></td>`
+        );
+      }
+      // Condition (rowspan covers entire cases-row).
+      if (condW > 0) {
+        const cond = condParts[r];
+        topTDs.push(
+          `<td rowspan="${rowOuterCount}" valign="middle" align="left" ` +
+          `width="${condW}" style="${condStyle}">${cond.html}</td>`
+        );
+      }
+      trHTML.push(`<tr>${topTDs.join("")}</tr>`);
+
+      // BOTTOM row (only when this cases-row has structure).
+      if (s.hasStructure) {
+        const botTDs = [];
+        for (const cell of s.bottomCells) {
+          botTDs.push(tdHTML(cell, 1));
+        }
+        trHTML.push(`<tr>${botTDs.join("")}</tr>`);
+      }
+    }
+
+    const totalW = braceW + valueW + condW;
+    return (
+      `<meta charset="utf-8">` +
+      `<table width="${totalW}" style="border-collapse:collapse;border:none;` +
+      `table-layout:auto;width:${totalW}px;">` +
+      trHTML.join("") +
+      `</table>`
+    );
+  }
+
+  // Mixed text + fraction(s) on one line — a single flat 2-row table,
+  // with text cells using rowspan="2" to span both rows and fraction
+  // cells split into num (row 1) + den (row 2, with the fraction bar
+  // as its top border).
+  //
+  // This replaces an earlier nested-table approach (outer row of
+  // cells, each fraction a nested 2-row sub-table). Docs' paste
+  // importer adds substantial padding around a nested table inside a
+  // cell, which was the real cause of the big top/bottom whitespace
+  // around every fraction. Flat → no nesting → no inflation.
+  //
+  // The original concern with rowspan (narrow cell + rowspan causing
+  // the spanning text to char-wrap) is handled here by explicit
+  // font-proportional widths plus white-space:nowrap on the text
+  // cells.
+  //
+  // Returns null if the sequence has no fraction/choose (caller falls
+  // back to plain text). Sequences that contain a matrix route to the
+  // flat matrix-sequence builder below so the surrounding text stays
+  // inline with the matrix instead of spilling into separate lines.
+  function buildSequenceHTML(parts, sourcePt) {
+    if (!parts || !parts.length) return null;
+    if (parts.some((p) => p.kind === "matrix")) {
+      const matrices = parts.filter((p) => p.kind === "matrix");
+      // Single-matrix sequences prefer the flat layout — it keeps every
+      // cell in one outer table, which avoids Docs' paste-importer
+      // padding around nested tables. When there are two or more
+      // structural blocks (e.g. `cases + bmatrix`) the flat builders
+      // can't align differing row counts, so fall back to the nested
+      // path that lays each structural block out as its own cell.
+      if (matrices.length === 1) {
+        const mp = matrices[0];
+        const flat = mp.style === "cases"
+          ? buildCasesSequenceHTML(parts, sourcePt)
+          : buildMatrixSequenceHTML(parts, sourcePt);
+        if (flat) return flat;
+      }
+      return buildNestedSequenceHTML(parts, sourcePt);
+    }
+
+    const textPt = sourcePt || 11;
+    const mathPt = resolveRenderPt(sourcePt);
+
+    let hasStructure = false;
+    const topCells = [];
+    const bottomCells = [];
+    let totalW = 0;
+
+    for (const part of parts) {
+      if (part.kind === "text") {
+        const valueHTML = part.valueHTML || part.value;
+        if (!valueHTML) continue;
+        setRichFont(textPt);
+        const contentPx = richMeasure(stripHTMLTags(valueHTML));
+        const w = cellWidthPx(contentPx, textPt, SEQ_TEXT_PAD_EM);
+        totalW += w;
+        // line-height:1.15 (not 1): Unicode subscript glyphs like ᵢ
+        // sit below the baseline and get clipped by a cell bottom
+        // set exactly to the font size. A small leading fixes that
+        // without inflating the row much. Font-family and font-size
+        // pinned on the <td> for the same reason as math cells (Docs
+        // may strip inline span styles).
+        const style =
+          `padding:0 !important;border:none;white-space:nowrap;` +
+          `line-height:1.15;` +
+          `text-align:center;` +
+          `vertical-align:middle;` +
+          `font-family:${CELL_FONT_FAMILY};` +
+          `font-size:${textPt}pt;` +
+          `font-weight:normal;${dbg("#0cc")}`;
+        topCells.push(
+          `<td rowspan="2" valign="middle" align="center" width="${w}" ` +
+          `height="1" style="${style}">${valueHTML}</td>`
+        );
+      } else if (part.kind === "fraction") {
+        hasStructure = true;
+        const numHTML = part.numHTML || part.num;
+        const denHTML = part.denHTML || part.den;
+        setRichFont(mathPt);
+        const contentPx = Math.max(
+          richMeasure(stripHTMLTags(numHTML)),
+          richMeasure(stripHTMLTags(denHTML))
+        );
+        const w = cellWidthPx(contentPx, mathPt, FRAC_SIDE_PAD_EM);
+        totalW += w;
+        const numStyle = mathCellStyle(mathPt, "#f00");
+        const denStyle =
+          mathCellStyle(mathPt, "#f00") + "border-top:0.75pt solid #000;";
+        topCells.push(
+          `<td align="center" width="${w}" height="1" style="${numStyle}">` +
+          numHTML +
+          `</td>`
+        );
+        bottomCells.push(
+          `<td align="center" width="${w}" height="1" style="${denStyle}">` +
+          denHTML +
+          `</td>`
+        );
+      } else if (part.kind === "choose") {
+        hasStructure = true;
+        const numHTML = part.numHTML || part.num;
+        const denHTML = part.denHTML || part.den;
+        setRichFont(mathPt);
+        const contentPx = Math.max(
+          richMeasure(stripHTMLTags(numHTML)),
+          richMeasure(stripHTMLTags(denHTML))
+        );
+        const contentW = cellWidthPx(contentPx, mathPt, FRAC_SIDE_PAD_EM);
+        const parenPt = mathPt * 1.9;
+        setRichFont(parenPt);
+        const parenGlyphPx = Math.max(richMeasure("("), richMeasure(")"));
+        const parenW = cellWidthPx(parenGlyphPx, parenPt, 0.05);
+        totalW += parenW * 2 + contentW;
+        const contentStyle = mathCellStyle(mathPt, "#f0f");
+        const parenStyle =
+          `padding:0 !important;border:none;line-height:1;` +
+          `white-space:nowrap;text-align:center;vertical-align:middle;` +
+          `font-family:${CELL_FONT_FAMILY};font-size:${parenPt}pt;` +
+          `font-weight:normal;${dbg("#f0f")}`;
+        topCells.push(
+          `<td rowspan="2" valign="middle" align="center" width="${parenW}" ` +
+          `style="${parenStyle}">` +
+          `<span style="font-size:${parenPt}pt;line-height:1;">(</span></td>` +
+          `<td align="center" width="${contentW}" height="1" style="${contentStyle}">` +
+          numHTML + `</td>` +
+          `<td rowspan="2" valign="middle" align="center" width="${parenW}" ` +
+          `style="${parenStyle}">` +
+          `<span style="font-size:${parenPt}pt;line-height:1;">)</span></td>`
+        );
+        bottomCells.push(
+          `<td align="center" width="${contentW}" height="1" style="${contentStyle}">` +
+          denHTML + `</td>`
+        );
+      }
+    }
+
+    if (!hasStructure) return null;
+
+    // Pin the table to the sum of cell widths so Docs' paste importer
+    // doesn't stretch it to paragraph width and dump the excess into
+    // whichever column has no content-width floor (the text cells).
+    return (
+      `<meta charset="utf-8">` +
+      `<table width="${totalW}" style="border-collapse:collapse;border:none;width:${totalW}px;">` +
+      `<tr>${topCells.join("")}</tr>` +
+      `<tr>${bottomCells.join("")}</tr>` +
+      `</table>`
+    );
+  }
+
+  // Flat rendering for sequences with a matrix: the outer table grows to
+  // matrix.rowCount rows, text parts span all rows via rowspan, and the
+  // matrix's own cells (plus bracket ticks) fill the remaining columns.
+  // Same approach as the fraction-sequence path — text sits inline with
+  // the structural block instead of spilling onto its own line.
+  // Fraction/choose/sqrt siblings get a rowspan=rowCount column each,
+  // with the inner structural table rendered by buildCellInner.
+  // Returns null for combinations this path doesn't handle (multi-matrix
+  // or `cases`); caller then falls through to plain text.
+  function buildMatrixSequenceHTML(parts, sourcePt) {
+    const matrices = parts.filter((p) => p.kind === "matrix");
+    if (matrices.length !== 1) return null;
+
+    const matrix = matrices[0];
+    if (matrix.style === "cases") return null;
+    const rowCount = matrix.rows.length;
+    if (!rowCount) return null;
+    const cols = Math.max(...matrix.rows.map((r) => (r ? r.length : 0)));
+    if (!cols) return null;
+
+    const mathPt = resolveRenderPt(sourcePt);
+    const textPt = sourcePt || 11;
+
+    const useHTML =
+      Array.isArray(matrix.rowsHTML) && matrix.rowsHTML.length === rowCount;
+    const useParts =
+      Array.isArray(matrix.rowsParts) && matrix.rowsParts.length === rowCount;
+    const cellHTML = (r, c) => {
+      if (useHTML && matrix.rowsHTML[r] && matrix.rowsHTML[r][c] != null) {
+        return matrix.rowsHTML[r][c];
+      }
+      return matrix.rows[r] && matrix.rows[r][c] != null ? matrix.rows[r][c] : "";
+    };
+    const cellPlain = (r, c) =>
+      matrix.rows[r] && matrix.rows[r][c] != null ? matrix.rows[r][c] : "";
+    const cellPartsAt = (r, c) =>
+      useParts && matrix.rowsParts[r] && matrix.rowsParts[r][c]
+        ? matrix.rowsParts[r][c]
+        : null;
+
+    const cellInner = [];
+    for (let r = 0; r < rowCount; r++) {
+      const row = [];
+      for (let c = 0; c < cols; c++) {
+        const cp = cellPartsAt(r, c);
+        if (cp) {
+          row.push(buildCellInner(cp, mathPt));
+        } else {
+          setRichFont(mathPt);
+          row.push({
+            html: cellHTML(r, c),
+            width: richMeasure(cellPlain(r, c)),
+            structural: false,
+          });
+        }
+      }
+      cellInner.push(row);
+    }
+
+    const columnWidths = [];
+    for (let c = 0; c < cols; c++) {
+      let maxW = 0;
+      for (let r = 0; r < rowCount; r++) {
+        const inner = cellInner[r][c];
+        const w = inner.structural
+          ? inner.width
+          : cellWidthPx(inner.width, mathPt, MATRIX_SIDE_PAD_EM);
+        maxW = Math.max(maxW, w);
+      }
+      columnWidths.push(maxW);
+    }
+
+    const bracketed = matrix.style !== "plain";
+    const isBar = matrix.style === "bar" || matrix.style === "doublebar";
+    const BRACKET = "1.25pt solid #000";
+    const BRACKET_CELL_W = 3;
+    const matrixCellStyle = mathCellStyle(mathPt, "#fa0");
+    const bracketCellStyle = (r, side) =>
+      `padding:0 !important;line-height:1;font-size:${mathPt}pt;` +
+      (side === "L"
+        ? `border-left:${BRACKET};border-right:0;`
+        : `border-right:${BRACKET};border-left:0;`) +
+      (r === 0 && !isBar ? `border-top:${BRACKET};` : `border-top:0;`) +
+      (r === rowCount - 1 && !isBar
+        ? `border-bottom:${BRACKET};`
+        : `border-bottom:0;`);
+
+    const rowsCells = Array.from({ length: rowCount }, () => []);
+    let totalW = 0;
+
+    for (const part of parts) {
+      if (part.kind === "text") {
+        const valueHTML = part.valueHTML || part.value;
+        if (!valueHTML) continue;
+        setRichFont(textPt);
+        const contentPx = richMeasure(stripHTMLTags(valueHTML));
+        const w = cellWidthPx(contentPx, textPt, MATRIX_TEXT_SIBLING_PAD_EM);
+        totalW += w;
+        const style =
+          `padding:0 !important;border:none;white-space:nowrap;` +
+          `line-height:1.15;` +
+          `text-align:center;` +
+          `vertical-align:middle;` +
+          `font-family:${CELL_FONT_FAMILY};` +
+          `font-size:${textPt}pt;` +
+          `font-weight:normal;${dbg("#0cc")}`;
+        rowsCells[0].push(
+          `<td rowspan="${rowCount}" valign="middle" align="center" ` +
+          `width="${w}" height="1" style="${style}">${valueHTML}</td>`
+        );
+      } else if (part.kind === "matrix") {
+        for (let r = 0; r < rowCount; r++) {
+          if (bracketed) {
+            rowsCells[r].push(
+              `<td width="${BRACKET_CELL_W}" ` +
+              `style="${bracketCellStyle(r, "L")}">&nbsp;</td>`
+            );
+          }
+          for (let c = 0; c < cols; c++) {
+            const inner = cellInner[r][c];
+            const content = inner.structural
+              ? inner.html
+              : richPara(mathPt, inner.html);
+            rowsCells[r].push(
+              `<td width="${columnWidths[c]}" style="${matrixCellStyle}">` +
+              content + `</td>`
+            );
+          }
+          if (bracketed) {
+            rowsCells[r].push(
+              `<td width="${BRACKET_CELL_W}" ` +
+              `style="${bracketCellStyle(r, "R")}">&nbsp;</td>`
+            );
+          }
+        }
+        totalW +=
+          columnWidths.reduce((a, b) => a + b, 0) +
+          (bracketed ? BRACKET_CELL_W * 2 : 0);
+      } else if (
+        part.kind === "fraction" ||
+        part.kind === "choose" ||
+        part.kind === "sqrt"
+      ) {
+        // Sibling structural part (e.g. `\frac{1}{2}` next to a matrix).
+        // Render the inner 2-row / paren-wrapped / √(…) shape as its own
+        // mini-table via buildCellInner and drop it into a single
+        // rowspan=rowCount column so it sits inline with the matrix
+        // instead of falling back to a plain-text `(1)/(2)` / `C(x,y)`.
+        const inner = buildCellInner([part], mathPt);
+        const w = inner.structural
+          ? inner.width
+          : cellWidthPx(inner.width, mathPt, TEXT_SIDE_PAD_EM);
+        totalW += w;
+        const content = inner.structural
+          ? inner.html
+          : richPara(mathPt, inner.html);
+        const style = inner.structural
+          ? `padding:0 !important;border:none;line-height:1;` +
+            `text-align:center;vertical-align:middle;${dbg("#a0f")}`
+          : `padding:0 !important;border:none;white-space:nowrap;` +
+            `line-height:1.15;text-align:center;vertical-align:middle;` +
+            `font-family:${CELL_FONT_FAMILY};font-size:${mathPt}pt;` +
+            `font-weight:normal;${dbg("#0cc")}`;
+        rowsCells[0].push(
+          `<td rowspan="${rowCount}" valign="middle" align="center" ` +
+          `width="${w}" height="1" style="${style}">${content}</td>`
+        );
+      }
+    }
+
+    const trHTML = rowsCells.map((tds) => `<tr>${tds.join("")}</tr>`).join("");
+    return (
+      `<meta charset="utf-8">` +
+      `<table width="${totalW}" style="border-collapse:collapse;border:none;` +
+      `width:${totalW}px;">` +
+      trHTML +
+      `</table>`
+    );
+  }
+
+  // Flat rendering for sequences that contain a `cases` block: mirrors
+  // buildMatrixSequenceHTML but assembles the brace glyph from Unicode
+  // bracket pieces (⎧⎨⎪⎩) emitted per-row, same structural pattern as
+  // the matrix's per-row bracket border cells. Using per-row brace
+  // pieces instead of one rowspan=N cell avoids stacking two
+  // rowspan=N cells (text + brace) in row 0, which Docs' paste
+  // importer sometimes laid out as two stacked lines. Fraction/choose/
+  // sqrt siblings outside the cases block get a rowspan=rowCount
+  // column each, produced by buildCellInner.
+  function buildCasesSequenceHTML(parts, sourcePt) {
+    const casesList = parts.filter(
+      (p) => p.kind === "matrix" && p.style === "cases"
+    );
+    if (casesList.length !== 1) {
+      LOG("cases-seq: bail (not exactly one cases block)");
+      return null;
+    }
+    if (parts.some((p) => p.kind === "matrix" && p.style !== "cases")) {
+      LOG("cases-seq: bail (non-cases matrix mixed in)");
+      return null;
+    }
+
+    const cases = casesList[0];
+    const rowCount = cases.rows.length;
+    if (!rowCount) {
+      LOG("cases-seq: bail (empty cases)");
+      return null;
+    }
+
+    const mathPt = resolveRenderPt(sourcePt);
+    const textPt = sourcePt || 11;
+
+    const useHTML =
+      Array.isArray(cases.rowsHTML) && cases.rowsHTML.length === rowCount;
+    const cellHTML = (r, c) => {
+      const source = useHTML ? cases.rowsHTML[r] : cases.rows[r];
+      if (!Array.isArray(source)) return "";
+      const v = source[c];
+      return v != null ? String(v) : "";
+    };
+    const cellPlain = (r, c) => {
+      const row = cases.rows[r];
+      if (!Array.isArray(row)) return "";
+      const v = row[c];
+      return v != null ? String(v) : "";
+    };
+
+    let valueW = 0;
+    let condW = 0;
+    for (let r = 0; r < rowCount; r++) {
+      const vPlain = cellPlain(r, 0);
+      if (vPlain) {
+        setRichFont(mathPt);
+        const w = cellWidthPx(
+          richMeasure(vPlain),
+          mathPt,
+          MATRIX_SIDE_PAD_EM
+        );
+        if (w > valueW) valueW = w;
+      }
+      const cPlain = cellPlain(r, 1);
+      if (cPlain) {
+        setRichFont(mathPt);
+        const w = cellWidthPx(
+          richMeasure(cPlain),
+          mathPt,
+          MATRIX_SIDE_PAD_EM
+        );
+        if (w > condW) condW = w;
+      }
+    }
+    const hasCondition = condW > 0;
+
+    // Assemble the brace from Unicode bracket pieces, one per row:
+    //   rowCount 1: single ⎰-ish glyph (rare; fall back to "{")
+    //   rowCount 2: ⎰ ⎱ (upper + lower halves, no middle)
+    //   rowCount 3+: ⎧ (top), ⎪ (extensions), ⎨ (middle), ⎪ ..., ⎩ (bottom)
+    //
+    // Pieces stack with line-height:1 so they join visually. Emitting
+    // one cell per row (matching value/cond cell counts) keeps the
+    // paste importer happy — it's the same structural pattern as the
+    // matrix's per-row bracket cells, which Docs handles cleanly.
+    const bracePiece = (r, n) => {
+      if (n === 1) return "{";
+      if (n === 2) return r === 0 ? "⎰" : "⎱";
+      if (r === 0) return "⎧";
+      if (r === n - 1) return "⎩";
+      const middle = Math.floor((n - 1) / 2);
+      if (r === middle) return "⎨";
+      return "⎪";
+    };
+
+    const bracePt = Math.round(mathPt * 1.4);
+    setRichFont(bracePt);
+    const braceW = cellWidthPx(richMeasure("⎨"), bracePt, 0.05);
+
+    const braceCellStyle =
+      `padding:0 !important;border:none;line-height:1;white-space:nowrap;` +
+      `text-align:center;vertical-align:middle;` +
+      `font-family:${CELL_FONT_FAMILY};font-size:${bracePt}pt;` +
+      `font-weight:normal;${dbg("#fa0")}`;
+    const valueCellStyle = mathCellStyle(mathPt, "#fa0", "left");
+    const condCellStyle = mathCellStyle(mathPt, "#fa0", "left");
+
+    const rowsCells = Array.from({ length: rowCount }, () => []);
+    let totalW = 0;
+
+    for (const part of parts) {
+      if (part.kind === "text") {
+        const valueHTML = part.valueHTML || part.value;
+        if (!valueHTML) continue;
+        setRichFont(textPt);
+        const contentPx = richMeasure(stripHTMLTags(valueHTML));
+        const w = cellWidthPx(contentPx, textPt, MATRIX_TEXT_SIBLING_PAD_EM);
+        totalW += w;
+        const style =
+          `padding:0 !important;border:none;white-space:nowrap;` +
+          `line-height:1.15;text-align:center;vertical-align:middle;` +
+          `font-family:${CELL_FONT_FAMILY};font-size:${textPt}pt;` +
+          `font-weight:normal;${dbg("#0cc")}`;
+        rowsCells[0].push(
+          `<td rowspan="${rowCount}" valign="middle" align="center" ` +
+          `width="${w}" height="1" style="${style}">${valueHTML}</td>`
+        );
+      } else if (part.kind === "matrix") {
+        for (let r = 0; r < rowCount; r++) {
+          const piece = bracePiece(r, rowCount);
+          rowsCells[r].push(
+            `<td width="${braceW}" align="center" ` +
+            `style="${braceCellStyle}">` +
+            `<span style="font-size:${bracePt}pt;line-height:1;">${piece}</span>` +
+            `</td>`
+          );
+          const vHTML = cellHTML(r, 0);
+          rowsCells[r].push(
+            `<td width="${valueW}" style="${valueCellStyle}">` +
+            (vHTML ? richPara(mathPt, vHTML) : "") +
+            `</td>`
+          );
+          if (hasCondition) {
+            const cHTML = cellHTML(r, 1);
+            rowsCells[r].push(
+              `<td width="${condW}" style="${condCellStyle}">` +
+              (cHTML ? richPara(mathPt, cHTML) : "") +
+              `</td>`
+            );
+          }
+        }
+        totalW += braceW + valueW + (hasCondition ? condW : 0);
+      } else if (
+        part.kind === "fraction" ||
+        part.kind === "choose" ||
+        part.kind === "sqrt"
+      ) {
+        // Sibling structural part outside the cases block
+        // (e.g. `\begin{cases}…\end{cases} + \binom{x}{y}`). Same
+        // rowspan=rowCount inline trick as buildMatrixSequenceHTML:
+        // render the fraction/choose/sqrt as a nested mini-table via
+        // buildCellInner and drop it into one column so it sits inline
+        // with the cases block instead of falling back to the
+        // plain-text `(n)/(d)` / `C(n,k)` form.
+        const inner = buildCellInner([part], mathPt);
+        const w = inner.structural
+          ? inner.width
+          : cellWidthPx(inner.width, mathPt, TEXT_SIDE_PAD_EM);
+        totalW += w;
+        const content = inner.structural
+          ? inner.html
+          : richPara(mathPt, inner.html);
+        const style = inner.structural
+          ? `padding:0 !important;border:none;line-height:1;` +
+            `text-align:center;vertical-align:middle;${dbg("#a0f")}`
+          : `padding:0 !important;border:none;white-space:nowrap;` +
+            `line-height:1.15;text-align:center;vertical-align:middle;` +
+            `font-family:${CELL_FONT_FAMILY};font-size:${mathPt}pt;` +
+            `font-weight:normal;${dbg("#0cc")}`;
+        rowsCells[0].push(
+          `<td rowspan="${rowCount}" valign="middle" align="center" ` +
+          `width="${w}" height="1" style="${style}">${content}</td>`
+        );
+      }
+    }
+
+    const trHTML = rowsCells.map((tds) => `<tr>${tds.join("")}</tr>`).join("");
+    LOG("cases-seq: built HTML", { rowCount, totalW, hasCondition });
+    return (
+      `<meta charset="utf-8">` +
+      `<table width="${totalW}" style="border-collapse:collapse;border:none;` +
+      `width:${totalW}px;">` +
+      trHTML +
+      `</table>`
+    );
+  }
+
+  // Nested fallback for sequences the flat builders can't handle —
+  // typically 2+ structural blocks with differing row counts (cases +
+  // bmatrix, bmatrix + bmatrix, etc). Renders each part as its own
+  // cell in a 1-row outer table; structural parts embed their
+  // standalone renderer's <table> verbatim (with the <meta> wrapper
+  // stripped). This pays the "nested-table paste padding" tax Docs
+  // adds around inner tables, so it's only used when flat layout is
+  // impossible.
+  function buildNestedSequenceHTML(parts, sourcePt) {
+    const mathPt = resolveRenderPt(sourcePt);
+    const textPt = sourcePt || 11;
+
+    // buildMatrixHTML / buildCasesHTML / buildChooseHTML embed the
+    // total table width as the first attribute — pluck it back out
+    // instead of duplicating the width math inline.
+    const stripMeta = (html) => html.replace(/^<meta[^>]*>/, "");
+    const parseW = (html) => {
+      const m = /<table\s+width="(\d+)"/.exec(html);
+      return m ? parseInt(m[1], 10) : 0;
+    };
+
+    const cells = [];
+    let totalW = 0;
+
+    for (const part of parts) {
+      if (part.kind === "text") {
+        const valueHTML = part.valueHTML || part.value;
+        if (!valueHTML) continue;
+        setRichFont(textPt);
+        const contentPx = richMeasure(stripHTMLTags(valueHTML));
+        const w = cellWidthPx(contentPx, textPt, MATRIX_TEXT_SIBLING_PAD_EM);
+        totalW += w;
+        const style =
+          `padding:0 !important;border:none;white-space:nowrap;` +
+          `line-height:1.15;text-align:center;vertical-align:middle;` +
+          `font-family:${CELL_FONT_FAMILY};font-size:${textPt}pt;` +
+          `font-weight:normal;${dbg("#0cc")}`;
+        cells.push(
+          `<td valign="middle" align="center" width="${w}" height="1" ` +
+          `style="${style}">${valueHTML}</td>`
+        );
+      } else if (part.kind === "sqrt") {
+        const c = part.contentHTML || part.content || "";
+        const v = "√(" + c + ")";
+        setRichFont(mathPt);
+        const contentPx = richMeasure(stripHTMLTags(v));
+        const w = cellWidthPx(contentPx, mathPt, MATRIX_TEXT_SIBLING_PAD_EM);
+        totalW += w;
+        const style =
+          `padding:0 !important;border:none;white-space:nowrap;` +
+          `line-height:1.15;text-align:center;vertical-align:middle;` +
+          `font-family:${CELL_FONT_FAMILY};font-size:${mathPt}pt;` +
+          `font-weight:normal;${dbg("#0cc")}`;
+        cells.push(
+          `<td valign="middle" align="center" width="${w}" height="1" ` +
+          `style="${style}">${v}</td>`
+        );
+      } else if (part.kind === "fraction") {
+        const inner = buildFractionInnerHTML(
+          part.numHTML || part.num,
+          part.denHTML || part.den,
+          mathPt
+        );
+        const w = parseW(inner);
+        totalW += w;
+        const style =
+          `padding:0 !important;border:none;line-height:1;` +
+          `text-align:center;vertical-align:middle;${dbg("#a0f")}`;
+        cells.push(
+          `<td valign="middle" align="center" width="${w}" ` +
+          `style="${style}">${inner}</td>`
+        );
+      } else if (part.kind === "choose") {
+        const full = buildChooseHTML(
+          part.numHTML || part.num,
+          part.denHTML || part.den,
+          sourcePt
+        );
+        const inner = stripMeta(full);
+        const w = parseW(full);
+        totalW += w;
+        const style =
+          `padding:0 !important;border:none;line-height:1;` +
+          `text-align:center;vertical-align:middle;${dbg("#a0f")}`;
+        cells.push(
+          `<td valign="middle" align="center" width="${w}" ` +
+          `style="${style}">${inner}</td>`
+        );
+      } else if (part.kind === "matrix") {
+        const full = part.style === "cases"
+          ? buildCasesHTML(part.rows, sourcePt, part.rowsHTML, part.rowsParts)
+          : buildMatrixHTML(
+              part.rows,
+              part.style,
+              sourcePt,
+              part.rowsHTML,
+              part.rowsParts
+            );
+        const inner = stripMeta(full);
+        // True matrices (not cases) get nudged right inside their
+        // purple wrapper cell via padding-left. An earlier attempt
+        // nested a table `[spacer | matrix]` inside the wrapper, but
+        // the nested table's border-collapse context clipped the
+        // matrix's left bracket stroke to a thinner line. Using
+        // padding on the wrapper <td> keeps the matrix table alone
+        // inside, so its bracket borders render at full thickness.
+        // Cases keep their natural centering (brace-on-left already
+        // provides the visual offset a bracketed matrix lacks).
+        const isMatrix = part.style !== "cases";
+        const MATRIX_LEFT_SHIFT = isMatrix ? 2 : 0;
+        const MATRIX_RIGHT_SHIFT = isMatrix ? 2 : 0;
+        const baseW = parseW(full);
+        // Content-box: declared width is content area, padding adds on
+        // top visually. totalW is visual (what the outer table sums).
+        // Cases cell is 1px narrower than matrices' centering slack so
+        // the right margin sits closer to the next part.
+        const w = baseW + (isMatrix ? 3 : 2);
+        totalW += w + MATRIX_LEFT_SHIFT + MATRIX_RIGHT_SHIFT;
+        const padStyle = (MATRIX_LEFT_SHIFT || MATRIX_RIGHT_SHIFT)
+          ? `padding:0 ${MATRIX_RIGHT_SHIFT}px 0 ${MATRIX_LEFT_SHIFT}px !important;`
+          : `padding:0 !important;`;
+        const style =
+          `${padStyle}border:none;line-height:1;` +
+          `text-align:center;vertical-align:middle;${dbg("#a0f")}`;
+        cells.push(
+          `<td valign="middle" align="center" width="${w}" ` +
+          `style="${style}">${inner}</td>`
+        );
+      }
+    }
+
+    if (!cells.length) return null;
+
+    // Outer table declares exactly the sum of cell widths — no extra
+    // slack. Earlier versions padded this by +24 to avoid clipping the
+    // last cell, but the extra appeared to get redistributed into
+    // cells, inflating the apparent spacing around each structural
+    // block. Same-total rule keeps every cell at its natural width.
+    return (
+      `<meta charset="utf-8">` +
+      `<table width="${totalW}" style="border-collapse:collapse;border:none;` +
+      `width:${totalW}px;">` +
+      `<tr>${cells.join("")}</tr>` +
+      `</table>`
+    );
+  }
+
+  function richToPlainText(rich) {
+    if (!rich) return "";
+    switch (rich.kind) {
+      case "text": return rich.value || "";
+      case "fraction": return "(" + rich.num + ")/(" + rich.den + ")";
+      case "choose": return "C(" + rich.num + "," + rich.den + ")";
+      case "matrix": return rich.rows.map((r) => r.join("\t")).join("\n");
+      case "sqrt": return "√(" + (rich.content || "") + ")";
+      case "sequence": return rich.parts.map(richToPlainText).join("");
+    }
+    return "";
+  }
+
+  // Given a rich compile result, produce the text/plain + text/html pair
+  // the paste dispatcher needs. Plain text is always set so pastes into
+  // non-Docs targets degrade gracefully.
+  function renderRich(rich, sourcePt) {
+    if (!rich) return { text: "", html: null };
+    let html = null;
+    if (rich.kind === "fraction") {
+      html = buildFractionHTML(
+        rich.numHTML || rich.num,
+        rich.denHTML || rich.den,
+        sourcePt
+      );
+    } else if (rich.kind === "choose") {
+      html = buildChooseHTML(
+        rich.numHTML || rich.num,
+        rich.denHTML || rich.den,
+        sourcePt
+      );
+    } else if (rich.kind === "matrix") {
+      if (rich.style === "cases") {
+        html = buildCasesHTML(rich.rows, sourcePt, rich.rowsHTML, rich.rowsParts);
+      } else {
+        html = buildMatrixHTML(rich.rows, rich.style, sourcePt, rich.rowsHTML, rich.rowsParts);
+      }
+    } else if (rich.kind === "sequence") {
+      html = buildSequenceHTML(rich.parts, sourcePt);
+    } else if (rich.kind === "text") {
+      // Pure text with no structural parts still needs an HTML
+      // version when the LaTeX had `_` or `^` — the HTML variant
+      // carries native <sub>/<sup> tags that Docs turns into real
+      // subscript/superscript formatting (Cmd+, / Cmd+.). Without
+      // this, the paste falls back to text/plain, which for
+      // unmappable args like `_{\delta}` shows as a literal "_δ".
+      const valueHTML = rich.valueHTML || "";
+      if (valueHTML && valueHTML.indexOf("<") >= 0) {
+        html = `<meta charset="utf-8">${valueHTML}`;
+      }
+    }
+    return { text: richToPlainText(rich), html };
   }
 
   function compile() {
@@ -68,6 +1682,52 @@
         equations_compiled: (Number(data.equations_compiled) || 0) + 1,
       });
     });
+  }
+
+  function showButtonToast(toast, text, keepOpen) {
+    if (!toast) return () => {};
+    clearTimeout(toast._hideTimer);
+    toast.textContent = text;
+    toast.style.opacity = "1";
+    const hide = () => {
+      clearTimeout(toast._hideTimer);
+      toast.style.opacity = "0";
+    };
+    if (!keepOpen) toast._hideTimer = setTimeout(hide, 1200);
+    return hide;
+  }
+
+  async function runCompileAll(toast) {
+    if (autocompile) {
+      showButtonToast(toast, "Autocompile is on");
+      return;
+    }
+    if (popupBusy) return;
+    // Snapshot and reverse: compile bottom-up so earlier replacements
+    // don't shift later regions' canvas coordinates.
+    const regions = greenRegions
+      .filter((r) => r.type === "compile")
+      .slice()
+      .reverse();
+    if (!regions.length) {
+      showButtonToast(toast, "Nothing to compile");
+      return;
+    }
+    popupBusy = true;
+    const hide = showButtonToast(toast, "Compiling…", true);
+    try {
+      for (const region of regions) {
+        try {
+          const ok = await replaceInDoc(region);
+          if (ok) compile();
+        } catch (err) {
+          LOG("compile-all replaceInDoc threw:", err);
+        }
+      }
+    } finally {
+      popupBusy = false;
+      hide();
+    }
   }
 
   // -- 1. Floating button (bottom-right, on <html> via Shadow DOM) --
@@ -114,13 +1774,31 @@
           object-fit: contain;
           pointer-events: none; user-select: none; -webkit-user-drag: none;
         }
+        .toast {
+          position: absolute;
+          right: 0;
+          bottom: 52px;
+          padding: 6px 10px;
+          background: #202124;
+          color: #fff;
+          font-family: 'Google Sans', Roboto, Arial, sans-serif;
+          font-size: 12px;
+          line-height: 1;
+          border-radius: 4px;
+          white-space: nowrap;
+          pointer-events: none;
+          opacity: 0;
+          transition: opacity 0.15s ease;
+        }
       </style>
+      <div class="toast" aria-hidden="true"></div>
       <button title="Compile All LaTeX Equations" aria-label="Compile All LaTeX Equations">
         <img src="${logoURL}" alt="" />
       </button>
     `;
 
-    shadow.querySelector("button").addEventListener("click", compile);
+    const toast = shadow.querySelector(".toast");
+    shadow.querySelector("button").addEventListener("click", () => runCompileAll(toast));
     document.documentElement.appendChild(host);
   }
 
@@ -137,7 +1815,7 @@
     wrapper.setAttribute("role", "button");
     wrapper.setAttribute("aria-label", "Compile All LaTeX Equations");
     wrapper.setAttribute("data-tooltip", "Compile All LaTeX Equations");
-    wrapper.style.cssText = "user-select:none;cursor:pointer;";
+    wrapper.style.cssText = "user-select:none;cursor:pointer;position:relative;";
 
     wrapper.innerHTML = `
       <div class="goog-toolbar-button-outer-box goog-inline-block" style="user-select:none;">
@@ -149,7 +1827,16 @@
       </div>
     `;
 
-    wrapper.addEventListener("click", compile);
+    const toast = document.createElement("div");
+    toast.style.cssText =
+      "position:absolute;top:100%;left:50%;transform:translateX(-50%);" +
+      "margin-top:6px;padding:6px 10px;background:#202124;color:#fff;" +
+      "font-family:'Google Sans',Roboto,Arial,sans-serif;font-size:12px;" +
+      "line-height:1;border-radius:4px;white-space:nowrap;pointer-events:none;" +
+      "opacity:0;transition:opacity 0.15s ease;z-index:9999;";
+    wrapper.appendChild(toast);
+
+    wrapper.addEventListener("click", () => runCompileAll(toast));
 
     const sep = document.getElementById("docs-toolbar-mode-switcher-separator");
     if (sep) {
@@ -186,7 +1873,7 @@
   function injectAll() {
     injectFloat();
     injectToolbarButton();
-    injectLabel();
+    //injectLabel();
   }
 
   function removeAll() {
@@ -288,11 +1975,21 @@
       if (regions && regions.length) newRegions.push(...regions);
     }
 
+    // Per-type identity key: compile regions are uniquely identified
+    // by their LaTeX source, decompile regions by their Unicode text.
+    // (canvas identity is part of the tuple so two identical glyphs on
+    // separate pages don't alias.)
+    const regionKey = (r) =>
+      r.type === "decompile" ? r.text : r.latex;
+
     // If the currently hovered region vanished from this rebuild, drop
     // the popup so it doesn't point at stale geometry.
     if (hoveredRegion) {
+      const wantKey = regionKey(hoveredRegion);
       const stillThere = newRegions.find(
-        (r) => r.latex === hoveredRegion.latex && r.canvas === hoveredRegion.canvas
+        (r) => r.type === hoveredRegion.type &&
+          regionKey(r) === wantKey &&
+          r.canvas === hoveredRegion.canvas
       );
       if (stillThere) hoveredRegion = stillThere;
       else { hoveredRegion = null; hidePopupImmediately(); }
@@ -301,8 +1998,11 @@
     // Re-point the caret-touched region too, and reapply dark paint
     // since marks are recreated on every rebuild.
     if (caretRegion) {
+      const wantKey = regionKey(caretRegion);
       const stillThere = newRegions.find(
-        (r) => r.latex === caretRegion.latex && r.canvas === caretRegion.canvas
+        (r) => r.type === caretRegion.type &&
+          regionKey(r) === wantKey &&
+          r.canvas === caretRegion.canvas
       );
       if (stillThere) {
         caretRegion = stillThere;
@@ -327,37 +2027,330 @@
     const sx = (canvas.width / cssW) || 1;
     const sy = (canvas.height / cssH) || 1;
 
+    // Strip zero-width and bidi-control characters from fragment text.
+    // Docs injects these at font-run boundaries (e.g. right after a
+    // native sup), and they otherwise poison downstream tokenization
+    // and paste output: a stuck U+200B before "=3" would keep the
+    // decompile run from extending through the tail of the equation.
+    const INVISIBLE_RE = /[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]/g;
+
     // Dedupe by position+text so redundant fillTexts don't create
     // spurious extra math regions in the concatenated reading-order text.
     const deduped = [];
     const seenKey = new Set();
     for (const f of frags) {
-      const key = Math.round(f.x) + "," + Math.round(f.y) + "," + f.text;
+      const cleanText = (f.text || "").replace(INVISIBLE_RE, "");
+      if (!cleanText) continue;
+      const cleaned = cleanText === f.text ? f : { ...f, text: cleanText };
+      const key = Math.round(cleaned.x) + "," + Math.round(cleaned.y) + "," + cleaned.text;
       if (seenKey.has(key)) continue;
       seenKey.add(key);
-      deduped.push(f);
+      deduped.push(cleaned);
     }
 
-    // Reading order: top-to-bottom, left-to-right. We join these with a
-    // single space separator (below) so a dangling "\" at one fragment's
-    // end can't fuse with "[" at the next fragment's start to form a
-    // spurious "\[".
-    deduped.sort((a, b) => a.y - b.y || a.x - b.x);
+    // Group fragments into logical lines, classify each one as
+    // normal / sup / sub relative to the dominant font size on its
+    // line. Native Cmd+./Cmd+, sup/sub rendering draws a smaller-font
+    // fragment at a raised or lowered y — the canvas has no style
+    // channel, so the only signal is the height and baseline relative
+    // to the line's main run.
+    const fontPx = (fnt) => {
+      const m = /([\d.]+)px/.exec(fnt || "");
+      return m ? parseFloat(m[1]) : 0;
+    };
+    const byY = [...deduped].sort((a, b) => a.y - b.y);
+    const lines = [];
+    for (const f of byY) {
+      const fTop = f.y;
+      const fBot = f.y + f.height;
+      let placed = false;
+      for (const line of lines) {
+        const lineH = line.yBot - line.yTop;
+        const overlap =
+          Math.min(fBot, line.yBot) - Math.max(fTop, line.yTop);
+        // 25% vertical overlap is enough: a raised superscript still
+        // dips into the baseline's bounding box, and we want it on the
+        // same line rather than on a ghost line above.
+        if (overlap > Math.min(f.height, lineH) * 0.25) {
+          line.fragments.push(f);
+          line.yTop = Math.min(line.yTop, fTop);
+          line.yBot = Math.max(line.yBot, fBot);
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) {
+        lines.push({ yTop: fTop, yBot: fBot, fragments: [f] });
+      }
+    }
 
-    const SEP = " ";
+    // Per-line baseline: the fragment with the largest font size is
+    // the normal-text run. Meaningfully smaller fragments (<85% of
+    // baseline size) offset vertically are sup/sub.
+    for (const line of lines) {
+      let baseSize = 0;
+      let baseFrag = null;
+      for (const f of line.fragments) {
+        const s = fontPx(f.font);
+        if (s > baseSize) { baseSize = s; baseFrag = f; }
+      }
+      for (const f of line.fragments) {
+        const s = fontPx(f.font);
+        if (!baseFrag || s === 0 || baseSize === 0 || s >= baseSize * 0.85) {
+          f.script = "normal";
+          continue;
+        }
+        const baseMid = baseFrag.y + baseFrag.height / 2;
+        const fMid = f.y + f.height / 2;
+        const tol = baseFrag.height * 0.1;
+        if (fMid < baseMid - tol) f.script = "sup";
+        else if (fMid > baseMid + tol) f.script = "sub";
+        else f.script = "normal";
+      }
+      line.fragments.sort((a, b) => a.x - b.x);
+    }
+    // Sort lines by their bottom edge, so a superscript rising above
+    // the baseline can't pull its line above the previous one.
+    lines.sort((a, b) => a.yBot - b.yBot);
+
+    // Matrix detection runs BEFORE fraction detection. A 2×2 matrix
+    // shares the "tight gap, matching x-centers, similar widths" shape
+    // of a fraction, so leaving fraction detection to run first would
+    // fold any small matrix into `(a b)/(c d)` and break the round-trip.
+    // By catching aligned-column groups first, only true single-column
+    // stacks (compiled \frac pairs) survive to the fraction pass below.
+    //
+    // Pseudos tagged script:"matrix" are non-"normal" but not sup/sub,
+    // so tokenHasDecomp treats the matrix range as decompileable even
+    // when every cell is plain ASCII digits, while decompileSource
+    // leaves them unwrapped.
+    {
+      // Bracket cells in buildMatrixHTML contain `&nbsp;` so the left/
+      // right bracket columns get a real rendered glyph on canvas at a
+      // minimal width. Those nbsp fragments would otherwise count as
+      // extra columns and corrupt both the column match and the
+      // generated LaTeX ("nbsp & 1 & 2 & nbsp"). Skip pure-whitespace
+      // fragments — \s in JS covers ASCII spaces, tabs, and U+00A0.
+      const realFrags = (line) =>
+        line.fragments.filter((f) => !f.pseudo && /\S/.test(f.text));
+      const centers = (line) =>
+        realFrags(line).map((f) => f.x + f.width / 2);
+      const colsMatch = (a, b) => {
+        if (a.length !== b.length || a.length < 2) return false;
+        for (let k = 0; k < a.length; k++) {
+          if (Math.abs(a[k] - b[k]) > 10) return false;
+        }
+        return true;
+      };
+      let i = 0;
+      while (i < lines.length) {
+        const start = i;
+        const baseCenters = centers(lines[start]);
+        if (baseCenters.length < 2) { i++; continue; }
+        let end = start;
+        while (end + 1 < lines.length) {
+          const A = lines[end];
+          const B = lines[end + 1];
+          // Slightly looser gap than fractions: matrix rows in Docs have
+          // a table-row gap of a couple px even at line-height:1.
+          if (B.yTop - A.yBot > 6) break;
+          if (!colsMatch(baseCenters, centers(B))) break;
+          end++;
+        }
+        if (end === start) { i++; continue; }
+
+        const rowCount = end - start + 1;
+        const pseudo = (text, x, y) => ({
+          text, x, y, width: 0, height: 0, font: "",
+          pseudo: true, script: "matrix",
+        });
+
+        const firstLine = lines[start];
+        const lastLine = lines[end];
+        const flat = [];
+        flat.push(pseudo("\\begin{bmatrix}", firstLine.fragments[0].x, firstLine.yTop));
+        for (let r = 0; r < rowCount; r++) {
+          const row = realFrags(lines[start + r]);
+          for (let c = 0; c < row.length; c++) {
+            if (c > 0) flat.push(pseudo("&", row[c].x, row[c].y));
+            // Cells with plain ASCII content would otherwise have no
+            // decompileable glyphs and fall out of the decompile run
+            // mid-matrix. Tag them "matrix" so tokenHasDecomp keeps the
+            // whole region together; sup/sub cells retain their script
+            // annotation so ^{…}/_{…} still wraps them correctly.
+            if (row[c].script !== "sup" && row[c].script !== "sub") {
+              row[c].script = "matrix";
+            }
+            flat.push(row[c]);
+          }
+          if (r < rowCount - 1) {
+            const refY = lines[start + r].yBot;
+            flat.push(pseudo("\\\\", row[row.length - 1].x, refY));
+          }
+        }
+        const lastRow = realFrags(lastLine);
+        const tailX = lastRow.length
+          ? lastRow[lastRow.length - 1].x + (lastRow[lastRow.length - 1].width || 0)
+          : lastLine.fragments[0].x;
+        flat.push(pseudo("\\end{bmatrix}", tailX, lastLine.yBot));
+
+        const merged = {
+          yTop: firstLine.yTop,
+          yBot: lastLine.yBot,
+          fragments: flat,
+        };
+        lines.splice(start, rowCount, merged);
+        i = start + 1;
+      }
+    }
+
+    // Fraction detection: two adjacent lines with a near-zero vertical
+    // gap, matching horizontal centers, and similar widths are the
+    // numerator/denominator halves of a compiled fraction. Fold each
+    // such pair into a single line whose fragment sequence is
+    // `( num )/( den )`, so concat and decompileSource hand the
+    // decompiler a "(…)/(…)" form that convertFrac turns back into
+    // \frac{num}{den} on click. Pseudo-fragments are tagged so the
+    // rect-emitting paths (pushBlock, findRegionSourcePt, spell-check)
+    // ignore them — they exist only to shape the concat string.
+    // Matrices have already been folded above, so any surviving
+    // adjacent-centered-lines pair is a real fraction.
+    const lineBounds = (line) => {
+      let minX = Infinity, maxX = -Infinity;
+      for (const f of line.fragments) {
+        if (f.pseudo) continue;
+        if (f.x < minX) minX = f.x;
+        if (f.x + f.width > maxX) maxX = f.x + f.width;
+      }
+      return {
+        minX, maxX,
+        cx: (minX + maxX) / 2,
+        w: Math.max(0, maxX - minX),
+      };
+    };
+    for (let i = 0; i < lines.length - 1; i++) {
+      const A = lines[i];
+      const B = lines[i + 1];
+      const gap = B.yTop - A.yBot;
+      // Prose line-spacing at 11pt Arial runs 8–12 CSS px of
+      // glyph-bottom-to-next-glyph-top once you account for actual
+      // bounding-box ascent/descent (canvas measureText gives tight
+      // glyph boxes, not the font's full em height). A compiled
+      // fraction uses line-height:1 and border:0.75pt so it runs
+      // tighter than prose, but the matching x-center signal does the
+      // real work here — 12px still excludes normal paragraph
+      // spacing (14–18px) without missing a slightly looser fraction.
+      if (gap > 12) continue;
+      const bA = lineBounds(A);
+      const bB = lineBounds(B);
+      if (!isFinite(bA.cx) || !isFinite(bB.cx)) continue;
+      // Matching x-center is the primary signal. A superscript in the
+      // denominator (`\frac{1}{2^2}`) can shift that cell's measured
+      // center right by half its sup width — so 6px tolerance covers
+      // an 11pt sup char without letting unrelated left-aligned prose
+      // match.
+      if (Math.abs(bA.cx - bB.cx) > 6) continue;
+      // Width ratio is a weak backstop — "1" over "2²" lands around
+      // 0.4, "x" over "y+1" around 0.2. Keep the bounds wide.
+      const wr = Math.max(bA.w, 1) / Math.max(bB.w, 1);
+      if (wr < 0.2 || wr > 5) continue;
+
+      // Tag both pseudos and real cell frags with script:"fraction".
+      // tokenHasDecomp keys off annotations, so an all-ASCII numerator
+      // like "abc" (none of sin/cos/digits/ops) still counts as mathy
+      // and stays inside the decompile run. decompileSource treats any
+      // non-sup/non-sub annotation as "normal", so no bracing leaks
+      // around the literal `(…)/(…)` output the pseudos already spell.
+      const pseudo = (text, x, y) => ({
+        text, x, y, width: 0, height: 0, font: "",
+        pseudo: true, script: "fraction",
+      });
+      for (const f of A.fragments) {
+        if (f.script !== "sup" && f.script !== "sub") f.script = "fraction";
+      }
+      for (const f of B.fragments) {
+        if (f.script !== "sup" && f.script !== "sub") f.script = "fraction";
+      }
+      const merged = {
+        yTop: A.yTop,
+        yBot: B.yBot,
+        fragments: [
+          pseudo("(", bA.minX, A.yTop),
+          ...A.fragments,
+          pseudo(")/(", bB.minX, (A.yBot + B.yTop) / 2),
+          ...B.fragments,
+          pseudo(")", bB.maxX, B.yBot),
+        ],
+      };
+      lines.splice(i, 2, merged);
+      // Don't rewind — single-level fraction only. Nested fractions
+      // would need recursive detection plus special handling so
+      // convertFrac's paren-matching still pairs correctly.
+    }
+
+    // Flatten back into the in-order list downstream code expects,
+    // remembering which fragment indices sit at the start of a new
+    // logical line. Fractions and matrices are already folded into
+    // single lines above, so these boundaries are real paragraph/line
+    // breaks — purple decompile runs get flushed on crossing one so a
+    // mathy token on line N doesn't drag a run across into line N+1.
+    deduped.length = 0;
+    const lineBoundaryFrags = new Set();
+    for (const line of lines) {
+      if (deduped.length > 0) lineBoundaryFrags.add(deduped.length);
+      for (const f of line.fragments) deduped.push(f);
+    }
+
+    // Build concat with per-char script annotations (parallel arrays
+    // indexed by UTF-16 code unit, same as concat itself). Separator
+    // is a newline across a line boundary and a space within one — both
+    // satisfy /\s/ for tokenization, but the newline is also the signal
+    // the purple-run builder uses to break runs at line ends.
     const fragStarts = new Array(deduped.length);
     const parts = [];
+    const annoParts = [];
     let pos = 0;
     for (let i = 0; i < deduped.length; i++) {
       if (i > 0) {
-        parts.push(SEP);
-        pos += SEP.length;
+        const sep = lineBoundaryFrags.has(i) ? "\n" : " ";
+        parts.push(sep);
+        // Separator annotations are deferred — a SEP between two
+        // sup fragments should bridge into a single ^{…} run, but we
+        // don't know the neighbors yet. Fill in a second pass below.
+        for (let k = 0; k < sep.length; k++) annoParts.push(null);
+        pos += sep.length;
       }
       fragStarts[i] = pos;
       parts.push(deduped[i].text);
+      const ann = deduped[i].script || "normal";
+      for (let k = 0; k < deduped[i].text.length; k++) annoParts.push(ann);
       pos += deduped[i].text.length;
     }
     const concat = parts.join("");
+    // Resolve deferred SEP annotations: a separator whose left and
+    // right neighbors share the same sup/sub annotation inherits it,
+    // so "a"/"b"/"c" sup fragments separated by SEPs collapse into one
+    // ^{abc} rather than three ^{a}^{b}^{c} during decompile.
+    {
+      const leftAnn = new Array(annoParts.length);
+      const rightAnn = new Array(annoParts.length);
+      let last = "normal";
+      for (let i = 0; i < annoParts.length; i++) {
+        if (annoParts[i] != null) last = annoParts[i];
+        leftAnn[i] = last;
+      }
+      last = "normal";
+      for (let i = annoParts.length - 1; i >= 0; i--) {
+        if (annoParts[i] != null) last = annoParts[i];
+        rightAnn[i] = last;
+      }
+      for (let i = 0; i < annoParts.length; i++) {
+        if (annoParts[i] == null) {
+          annoParts[i] = leftAnn[i] === rightAnn[i] ? leftAnn[i] : "normal";
+        }
+      }
+    }
+    const annotations = annoParts;
 
     // Math regions: \[ ... \] and \( ... \). Non-greedy pairs the
     // earliest closer with each opener, and the alternation prevents
@@ -399,6 +2392,11 @@
       for (let fi = 0; fi < deduped.length; fi++) {
         const fs = fragStarts[fi];
         const f = deduped[fi];
+        // Pseudo-fragments (fraction parens/rules, etc.) exist only to
+        // shape concat for decompile. They have no drawn geometry, so
+        // emitting a rect for them would produce a zero-width box or
+        // misuse the scratch canvas font from the previous iteration.
+        if (f.pseudo) continue;
         const L = f.text.length;
         const localStart = Math.max(0, ra - fs);
         const localEnd = Math.min(L, rb - fs);
@@ -463,6 +2461,26 @@
       }
     }
 
+    // Fragment fonts come from the MAIN-world highlighter as canvas
+    // font strings ("Npx Family…"). We need the source pt size so
+    // fractions/matrices can be rendered proportionally to it.
+    const findRegionSourcePt = (ra, rb) => {
+      for (let fi = 0; fi < deduped.length; fi++) {
+        const fs = fragStarts[fi];
+        const f = deduped[fi];
+        if (f.pseudo) continue;
+        const localStart = Math.max(0, ra - fs);
+        const localEnd = Math.min(f.text.length, rb - fs);
+        if (localStart >= localEnd) continue;
+        const fnt = f.font || "";
+        const ptM = /(\d+(?:\.\d+)?)pt/.exec(fnt);
+        if (ptM) return parseFloat(ptM[1]);
+        const pxM = /(\d+(?:\.\d+)?)px/.exec(fnt);
+        if (pxM) return parseFloat(pxM[1]) * (72 / 96);
+      }
+      return 11;
+    };
+
     // Green math marks are always created. The underline shows in both
     // modes; the tinted background only in debug (caret-touched regions
     // pick up the dark bg via paintRegion regardless of mode).
@@ -476,11 +2494,179 @@
       if (rects.length) {
         const latex = concat.substring(ra, rb);
         regionsOut.push({
+          type: "compile",
           rects,
           latex,
-          compiled: compileText(latex),
+          rich: compileRich(latex),
           canvas,
           marks,
+          sourcePt: findRegionSourcePt(ra, rb),
+        });
+      }
+    }
+
+    // Purple (decompile) regions: contiguous non-whitespace runs in
+    // the concatenated canvas text that contain at least one glyph we
+    // can turn back into a LaTeX command (Greek, super/subscripts,
+    // math operators, blackboard bold, …). These cover both content
+    // we previously pasted as compile output AND any Unicode math the
+    // user typed or pasted in directly — we don't care where it came
+    // from, only that there's a round-trip name for it.
+    //
+    // Anything that overlaps a green \(...\) / \[...\] region or an
+    // unclosed opener is already LaTeX source, not output, and is
+    // excluded so we don't offer to "decompile" a literal \alpha.
+    const hasDecompileableFn =
+      typeof window.hasDecompileable === "function"
+        ? window.hasDecompileable
+        : () => false;
+    const canDecompile = typeof window.unicodeToLatex === "function";
+
+    // Token-level decompile range detection. Split concat on
+    // whitespace, classify each token, and join consecutive
+    // math-looking tokens into one run — so "α + β = γ" underlines
+    // as one continuous region instead of three. A run is only
+    // emitted if it contains at least one glyph we can actually
+    // convert, or a sup/sub-annotated char (native Cmd+./Cmd+,
+    // formatting round-trips as ^{…}/_{…} even when the base
+    // characters are plain ASCII).
+    const TEXT_OPS_SET = new Set([
+      "sin","cos","tan","sec","csc","cot",
+      "arcsin","arccos","arctan",
+      "sinh","cosh","tanh","coth",
+      "log","ln","lg","exp",
+      "lim","limsup","liminf","sup","inf",
+      "max","min","arg","det","dim","ker","hom",
+      "gcd","lcm",
+    ]);
+    const hasScriptInRange = (a, b) => {
+      for (let i = a; i < b; i++) {
+        if (annotations[i] && annotations[i] !== "normal") return true;
+      }
+      return false;
+    };
+    // Docs occasionally sprinkles invisible control characters — zero-
+    // width spaces, joiners, bidi markers — at font-run boundaries
+    // (e.g. between a native sup fragment and the normal text that
+    // follows it). These are not matched by /\s/, so the token parser
+    // would glue them to the adjacent text and fail the math-char
+    // whitelist, cutting the decompile run short right before the tail
+    // of the equation. Treat them as whitespace for tokenization so a
+    // stuck invisible can't orphan the "=3" after "α²".
+    //   U+200B–U+200F: ZWSP, ZWNJ, ZWJ, LRM, RLM
+    //   U+202A–U+202E: embedding/override bidi controls
+    //   U+2060      : word joiner
+    //   U+FEFF      : zero-width NBSP / BOM
+    const TOKEN_SEP = /[\s\u200B-\u200F\u202A-\u202E\u2060\uFEFF]/;
+    const tokens = [];
+    {
+      let p = 0;
+      while (p < concat.length) {
+        while (p < concat.length && TOKEN_SEP.test(concat[p])) p++;
+        if (p >= concat.length) break;
+        const s = p;
+        while (p < concat.length && !TOKEN_SEP.test(concat[p])) p++;
+        tokens.push({ start: s, end: p, text: concat.substring(s, p) });
+      }
+    }
+    const tokenHasDecomp = (tk) =>
+      hasDecompileableFn(tk.text) || hasScriptInRange(tk.start, tk.end);
+    const isMathyToken = (tk) => {
+      const t = tk.text;
+      if (tokenHasDecomp(tk)) return true;
+      if (TEXT_OPS_SET.has(t.toLowerCase())) return true;
+      const cp = Array.from(t);
+      // Single-char variable or digit — common ingredient of inline
+      // math. Multi-letter tokens without any digit/operator look
+      // like prose and are excluded.
+      if (cp.length === 1 && /[a-zA-Z0-9]/.test(cp[0])) return true;
+      if (/^[+\-*=<>()[\]|.,:;/]+$/.test(t)) return true;
+      if (/^[a-zA-Z0-9+\-*=<>()[\]|.,:;/]+$/.test(t) &&
+          /[0-9+\-*=<>()[\]|/]/.test(t)) return true;
+      return false;
+    };
+    const decompileRanges = [];
+    if (canDecompile) {
+      let run = null;
+      const flushRun = () => {
+        if (run && run.hasDecomp) decompileRanges.push([run.start, run.end]);
+        run = null;
+      };
+      for (const tk of tokens) {
+        if (isMathyToken(tk)) {
+          const d = tokenHasDecomp(tk);
+          // A newline in the gap since the last token means we've
+          // crossed a logical line boundary. Decompile runs are not
+          // allowed to straddle lines — "α² + 1" on line 1 and "β = 2"
+          // on line 2 should be two separate purple regions, not one.
+          const crossesLine =
+            run && concat.substring(run.end, tk.start).includes("\n");
+          if (!run || crossesLine) {
+            flushRun();
+            run = { start: tk.start, end: tk.end, hasDecomp: d };
+          } else {
+            run.end = tk.end;
+            if (d) run.hasDecomp = true;
+          }
+        } else {
+          flushRun();
+        }
+      }
+      flushRun();
+      // Drop ranges that overlap \[…\] / \(…\) or unclosed openers —
+      // those are LaTeX source, not rendered output.
+      for (let i = decompileRanges.length - 1; i >= 0; i--) {
+        if (isCovered(decompileRanges[i][0], decompileRanges[i][1])) {
+          decompileRanges.splice(i, 1);
+        }
+      }
+    }
+
+    // Build the decompile-source text for a concat range, folding
+    // sup/sub annotated runs into ^{…}/_{…} before the caller hands
+    // it to unicodeToLatex. Natively-formatted scripts (Cmd+./Cmd+,)
+    // have no ^ or _ markers on the canvas; the annotations we built
+    // from line geometry restore that structural info for LaTeX.
+    const decompileSource = (ra, rb) => {
+      let out = "";
+      let state = "normal";
+      for (let i = ra; i < rb; i++) {
+        const raw = annotations[i] || "normal";
+        // Only sup/sub annotations drive the ^{…}/_{…} wrapping.
+        // Other non-"normal" values (e.g. "matrix") exist so that
+        // tokenHasDecomp treats the region as decompileable, but
+        // shouldn't bracket the output — the pseudo-fragments already
+        // spell out their own LaTeX structure.
+        const ann = raw === "sup" || raw === "sub" ? raw : "normal";
+        if (ann !== state) {
+          if (state !== "normal") out += "}";
+          if (ann === "sup") out += "^{";
+          else if (ann === "sub") out += "_{";
+          state = ann;
+        }
+        out += concat[i];
+      }
+      if (state !== "normal") out += "}";
+      return out;
+    };
+
+    const decompileBg = debugMode ? PURPLE_BG : "transparent";
+    const decompileBorder = PURPLE_BORDER;
+    for (const [ra, rb] of decompileRanges) {
+      const rects = [];
+      const marks = [];
+      pushBlock(ra, rb, decompileBg, decompileBorder, rects, marks);
+      if (rects.length) {
+        regionsOut.push({
+          type: "decompile",
+          rects,
+          // Pre-wrapped with ^{…}/_{…} for sup/sub runs. The click
+          // handler feeds this through unicodeToLatex to fold Greek /
+          // blackboard / unicode script glyphs into LaTeX names.
+          text: decompileSource(ra, rb),
+          canvas,
+          marks,
+          sourcePt: findRegionSourcePt(ra, rb),
         });
       }
     }
@@ -496,6 +2682,7 @@
     if (debugMode) {
       for (let fi = 0; fi < deduped.length; fi++) {
         const f = deduped[fi];
+        if (f.pseudo) continue;
         const words = splitWords(f.text);
         if (!words.length) continue;
 
@@ -638,6 +2825,11 @@
         }
         .btn:hover { background: #388e3c; transform: translateY(-1px); }
         .btn:active { transform: translateY(0); }
+        /* Purple variant for decompile regions. Listed before .is-toast
+           so the toast state (black) still wins when both classes are
+           present — same-specificity rules fall back to source order. */
+        .btn.is-purple { background: #9c27b0; }
+        .btn.is-purple:hover { background: #7b1fa2; }
         .btn.is-toast {
           background: #1a1a1a;
           cursor: default;
@@ -694,7 +2886,9 @@
     ensurePopup();
     clearTimeout(popupHideTimer);
     popupBtn.classList.remove("is-toast");
-    popupLabel.textContent = "Compile";
+    const isDecompile = region && region.type === "decompile";
+    popupBtn.classList.toggle("is-purple", isDecompile);
+    popupLabel.textContent = isDecompile ? "Decompile" : "Compile";
     popupHost.style.display = "block";
     repositionPopup();
   }
@@ -818,9 +3012,10 @@
     return editableFrames[0] || null;
   }
 
-  function dispatchPaste(target, text) {
+  function dispatchPaste(target, text, html) {
     const dt = new DataTransfer();
     dt.setData("text/plain", text);
+    if (html) dt.setData("text/html", html);
     const evt = new ClipboardEvent("paste", {
       clipboardData: dt,
       bubbles: true,
@@ -842,9 +3037,10 @@
     return !evt.defaultPrevented;
   }
 
-  function dispatchBeforeInput(target, text) {
+  function dispatchBeforeInput(target, text, html) {
     const dt = new DataTransfer();
     dt.setData("text/plain", text);
+    if (html) dt.setData("text/html", html);
     const evt = new InputEvent("beforeinput", {
       inputType: "insertFromPaste",
       data: text,
@@ -895,6 +3091,20 @@
       } catch (_) {}
     };
 
+    // Collapse any pre-existing selection with a bare click. Docs
+    // treats pointerdown-inside-an-active-selection as the start of a
+    // text drag-and-drop, not a new selection — so if the user had
+    // part of this region highlighted when they clicked Compile, the
+    // drag below wouldn't change the selection and the paste would
+    // replace only their partial highlight. The sleep keeps the
+    // drag-start from being coalesced into a double-click, which
+    // would select by word instead of by character.
+    send("pointerdown", x1, y1, 1);
+    send("mousedown",   x1, y1, 1);
+    send("pointerup",   x1, y1, 0);
+    send("mouseup",     x1, y1, 0);
+    await sleep(550);
+
     send("pointerdown", x1, y1, 1);
     send("mousedown",   x1, y1, 1);
     await sleep(30);
@@ -913,8 +3123,10 @@
   }
 
   async function replaceInDoc(region) {
-    // Drag-select the LaTeX on the canvas so the forthcoming paste
-    // replaces it instead of inserting alongside it.
+    // Select the target on the canvas so the forthcoming paste replaces
+    // it instead of inserting alongside it. Same mechanism for compile
+    // (select the \(...\) source) and decompile (select the Unicode math
+    // run).
     await selectRegionOnCanvas(region);
 
     const iframe = findDocsIframe();
@@ -926,6 +3138,34 @@
     const body = doc && doc.body;
     if (!body) { LOG("iframe has no body"); return false; }
 
+    let text, html;
+    if (region.type === "decompile") {
+      // Unicode → LaTeX source, wrapped in \(...\) so the resulting
+      // text is immediately eligible to compile again. No text/html
+      // variant — LaTeX source is literal characters that Docs should
+      // insert verbatim, not formatted content.
+      const src = region.text || "";
+      const toLatex =
+        typeof window.unicodeToLatex === "function"
+          ? window.unicodeToLatex
+          : (x) => x;
+      text = "\\(" + toLatex(src) + "\\)";
+      html = null;
+      LOG("decompiling:", JSON.stringify(src), "→", JSON.stringify(text));
+    } else {
+      const rendered = renderRich(region.rich, region.sourcePt);
+      text = rendered.text;
+      html = rendered.html;
+      LOG(
+        "rich kind:",
+        region.rich && region.rich.kind,
+        "sourcePt:",
+        region.sourcePt,
+        "html?",
+        !!html
+      );
+    }
+
     const targets = [doc.activeElement, body, doc.documentElement].filter(
       (t, i, arr) => t && arr.indexOf(t) === i
     );
@@ -933,8 +3173,8 @@
 
     let anyOk = false;
     for (const target of targets) {
-      const pasteOk = dispatchPaste(target, region.compiled);
-      const inputOk = dispatchBeforeInput(target, region.compiled);
+      const pasteOk = dispatchPaste(target, text, html);
+      const inputOk = dispatchBeforeInput(target, text, html);
       LOG(
         "  →",
         target.tagName,
@@ -951,14 +3191,15 @@
   let popupBusy = false;
 
   async function onCompileClick() {
-    LOG("Compile clicked");
+    LOG("popup action clicked");
     if (!hoveredRegion || popupBusy) {
       LOG("skip: hovered=", !!hoveredRegion, "busy=", popupBusy);
       return;
     }
     const region = hoveredRegion;
+    const isDecompile = region.type === "decompile";
     popupBusy = true;
-    flashToast("Typing…", true);
+    flashToast(isDecompile ? "Decompiling…" : "Typing…", true);
     let ok = false;
     try {
       ok = await replaceInDoc(region);
@@ -1012,6 +3253,10 @@
   function regionAtCaret(caretRect) {
     if (!caretRect) return null;
     for (const region of greenRegions) {
+      // Caret-follow highlight and auto-compile only make sense for
+      // compile (green) regions — landing the cursor in the middle of
+      // a Unicode math run shouldn't offer to auto-decompile it.
+      if (region.type !== "compile") continue;
       for (const r of region.viewportRects || []) {
         if (
           caretRect.left <= r.right + CARET_TOUCH_SLOP &&
@@ -1042,8 +3287,30 @@
     }
   }
 
+  const AUTOCOMPILE_MIN_INTERVAL_MS = 1000;
+  let autoCompileLastRun = 0;
+  let autoCompilePendingTimer = null;
+  let autoCompilePendingRegion = null;
+
   async function triggerAutoCompile(region) {
     if (popupBusy) return;
+    const now = Date.now();
+    const elapsed = now - autoCompileLastRun;
+    if (elapsed < AUTOCOMPILE_MIN_INTERVAL_MS) {
+      // Coalesce rapid triggers: keep only the latest region and fire
+      // once the cooldown expires.
+      autoCompilePendingRegion = region;
+      if (!autoCompilePendingTimer) {
+        autoCompilePendingTimer = setTimeout(() => {
+          autoCompilePendingTimer = null;
+          const r = autoCompilePendingRegion;
+          autoCompilePendingRegion = null;
+          if (r && greenRegions.includes(r)) triggerAutoCompile(r);
+        }, AUTOCOMPILE_MIN_INTERVAL_MS - elapsed);
+      }
+      return;
+    }
+    autoCompileLastRun = now;
     popupBusy = true;
     try {
       const ok = await replaceInDoc(region);
