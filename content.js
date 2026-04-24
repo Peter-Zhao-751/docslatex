@@ -131,6 +131,13 @@
   // cells are tighter than the others — the bar ends nearly flush
   // with the widest digit, which reads cleanest for inline math.
   const FRAC_SIDE_PAD_EM = 0.075;
+  // \binom{n}{k} content cells get a bit more horizontal slack than a
+  // bare fraction. The enclosing `(` and `)` glyphs sit tight against
+  // the inner column's left/right edges — fractions have only the
+  // horizontal bar above/below, so they tolerate a narrower column
+  // without looking cramped. This constant is only used by
+  // buildChooseHTML; fractions stay on FRAC_SIDE_PAD_EM.
+  const CHOOSE_SIDE_PAD_EM = 0.2;
   // Matrix has two spacing knobs the other structures don't need:
   //
   // MATRIX_SIDE_PAD_EM — horizontal slack inside each matrix column
@@ -142,10 +149,12 @@
   // MATRIX_TEXT_SIBLING_PAD_EM — slack around a text cell that sits
   // directly next to a matrix (or a cases block). Zero would leave the
   // `+`/`=` glyph touching the bracket/brace, which reads cramped;
-  // this tiny pad unsticks them without introducing an obvious gutter.
+  // this pad unsticks them and gives leading/trailing text in a
+  // nested sequence (e.g. "x = " before a √ or a \binom) a visible
+  // breathing room.
   // Non-matrix sequences stick with SEQ_TEXT_PAD_EM (=0) since their
   // text sits next to a fraction bar / open space, not a bracket edge.
-  const MATRIX_TEXT_SIBLING_PAD_EM = 0.08;
+  const MATRIX_TEXT_SIBLING_PAD_EM = 0.2;
   const TEXT_SIDE_PAD_EM = 0.15 + CELL_SAFETY_EM;
   // Text cells in any sequence builder are measured to their exact
   // rendered width — no side slack. Keeps text flush against adjacent
@@ -289,7 +298,7 @@
       richMeasure(stripHTMLTags(numHTML)),
       richMeasure(stripHTMLTags(denHTML))
     );
-    const w = cellWidthPx(contentPx, pt, FRAC_SIDE_PAD_EM);
+    const w = cellWidthPx(contentPx, pt, CHOOSE_SIDE_PAD_EM);
     const contentStyle = mathCellStyle(pt, "#f0f");
     const contentCell = (c) =>
       `<td align="center" width="${w}" height="1" style="${contentStyle}">` +
@@ -439,7 +448,7 @@
           richMeasure(stripHTMLTags(numHTML)),
           richMeasure(stripHTMLTags(denHTML))
         );
-        const contentW = cellWidthPx(contentPx, pt, FRAC_SIDE_PAD_EM);
+        const contentW = cellWidthPx(contentPx, pt, CHOOSE_SIDE_PAD_EM);
         const parenPt = pt * 1.9;
         setRichFont(parenPt);
         const parenGlyphPx = Math.max(richMeasure("("), richMeasure(")"));
@@ -718,7 +727,7 @@
             richMeasure(stripHTMLTags(denHTML))
           ),
           pt,
-          FRAC_SIDE_PAD_EM
+          CHOOSE_SIDE_PAD_EM
         );
         const parenPt = pt * 1.9;
         setRichFont(parenPt);
@@ -860,16 +869,28 @@
     let totalOuterRows = 0;
     for (const s of sections) totalOuterRows += s.hasStructure ? 2 : 1;
 
-    // Oversized brace. 1.1× per outer row is a reasonable height.
-    const bracePt = Math.max(pt * 1.8, pt * totalOuterRows * 1.1);
+    // Single `{` glyph spanning all rows. Size it so its line-box
+    // (font-size × line-height:1) equals the block height, so the
+    // glyph's natural visual center lands at the line-box center —
+    // which is also the cell's vertical midline under valign=middle.
+    // Equivalent fill without relying on padding-top hacks (Docs's
+    // paste importer strips cell padding on rowspan cells
+    // unpredictably) or Unicode piece stacking (leaves visible seams
+    // between cells).
+    const bracePt = Math.max(pt * 1.8, pt * totalOuterRows * 1.15);
     setRichFont(bracePt);
     const braceW = cellWidthPx(richMeasure("{"), bracePt, 0);
 
+    // Strut-kill the cell: font-size:0/line-height:0 zeros the implicit
+    // text strut Docs otherwise inserts at the declared font-size of a
+    // td. Without this, the rowspan region gets inflated to bracePt's
+    // strut height and Docs splits the `{` glyph into disjoint top and
+    // bottom halves. The inner <span> restores the visible glyph size.
     const braceStyle =
-      `padding:0 !important;border:none;line-height:1;white-space:nowrap;` +
+      `padding:0 !important;border:none;line-height:0;white-space:nowrap;` +
       `text-align:center;vertical-align:middle;` +
       `font-family:${CELL_FONT_FAMILY};` +
-      `font-size:${bracePt}pt;font-weight:normal;` +
+      `font-size:0;font-weight:normal;` +
       dbg("#fa0");
     const condStyle = mathCellStyle(pt, "#fa0", "left");
 
@@ -981,13 +1002,26 @@
       // structural blocks (e.g. `cases + bmatrix`) the flat builders
       // can't align differing row counts, so fall back to the nested
       // path that lays each structural block out as its own cell.
-      if (matrices.length === 1) {
-        const mp = matrices[0];
-        const flat = mp.style === "cases"
-          ? buildCasesSequenceHTML(parts, sourcePt)
-          : buildMatrixSequenceHTML(parts, sourcePt);
+      // Cases sequences go through the nested path so the cases block
+      // renders as its own mini-table in a cell (`buildCasesHTML`),
+      // rather than being flattened into the outer sequence table by
+      // `buildCasesSequenceHTML`. Flat was avoiding Docs' nested-table
+      // padding tax, but that layout also drops the visible grouping:
+      // the brace, the per-row value, and the condition column all
+      // look like siblings of the surrounding text instead of one
+      // cases block. A nested table keeps the cases visually bounded.
+      if (matrices.length === 1 && matrices[0].style !== "cases") {
+        const flat = buildMatrixSequenceHTML(parts, sourcePt);
         if (flat) return flat;
       }
+      return buildNestedSequenceHTML(parts, sourcePt);
+    }
+
+    // Sqrt-in-sequence (no matrix): route to the nested builder so the
+    // √ gets a real radical (buildSqrtInnerHTML's nested table with
+    // vinculum) instead of falling through to the text path as "√(x)".
+    // The main flat loop below handles text/fraction/choose only.
+    if (parts.some((p) => p.kind === "sqrt")) {
       return buildNestedSequenceHTML(parts, sourcePt);
     }
 
@@ -1058,7 +1092,7 @@
           richMeasure(stripHTMLTags(numHTML)),
           richMeasure(stripHTMLTags(denHTML))
         );
-        const contentW = cellWidthPx(contentPx, mathPt, FRAC_SIDE_PAD_EM);
+        const contentW = cellWidthPx(contentPx, mathPt, CHOOSE_SIDE_PAD_EM);
         const parenPt = mathPt * 1.9;
         setRichFont(parenPt);
         const parenGlyphPx = Math.max(richMeasure("("), richMeasure(")"));
@@ -1475,6 +1509,71 @@
     );
   }
 
+  // √x as a single-row nested table: [ √ glyph | radicand ]. The
+  // vinculum is the radicand cell's border-top — no separate spacer
+  // row, since Docs' paste importer refuses to collapse empty rows
+  // below ~12px regardless of font-size:0/line-height:0.
+  //
+  // sqrtPt = pt * glyphScale. The √ glyph needs to be visibly taller
+  // than the radicand so the hook sits above it and the diagonal
+  // descends across the body. 1.4× matches what \sqrt does at
+  // body-size in typical serif fonts without requiring an extensible
+  // radical glyph.
+  //
+  // With vertical-align:middle on both cells, the (taller) √ glyph
+  // pushes the row height to sqrtPt, and the radicand sits centered
+  // inside that row. The vinculum (drawn at the cell top) thus lands
+  // ~(sqrtPt-pt)/2 above the radicand content — the small gap you
+  // expect above a radical's body — while connecting seamlessly to
+  // the √ glyph's top-right corner.
+  function buildSqrtInnerHTML(contentHTML, pt, glyphScale) {
+    const sqrtPt = Math.max(4, pt * (glyphScale || 1.4));
+    setRichFont(pt);
+    const contentPx = richMeasure(stripHTMLTags(contentHTML));
+    const contentW = cellWidthPx(contentPx, pt, FRAC_SIDE_PAD_EM) + 1;
+    setRichFont(sqrtPt);
+    const glyphW = cellWidthPx(richMeasure("√"), sqrtPt, 0);
+    const totalW = glyphW + contentW;
+    // Modeled on buildMatrixHTML's bracket cells, which draw `[` / `]`
+    // via cell borders at the table edge. Key detail: don't call
+    // dbg() here — dbg() emits `border:0;` in non-debug mode, and a
+    // border shorthand AFTER a longhand wipes the longhand (CSS
+    // cascade: later declaration wins). That was silently killing
+    // the vinculum every attempt. Matrix bracket cells sidestep this
+    // by simply not calling dbg() at all.
+    // Vinculum only on the radicand cell, not on the √ glyph cell —
+    // the horizontal bar should start at the √'s top-right and extend
+    // over the radicand, not continue across the glyph itself.
+    // 0.75pt matches the fraction bar's stroke weight.
+    const VINCULUM = "0.75pt solid #000";
+    const glyphStyle =
+      `padding:0 !important;` +
+      `border:0;` +
+      `line-height:1;white-space:nowrap;` +
+      `text-align:center;vertical-align:middle;` +
+      `font-family:${CELL_FONT_FAMILY};` +
+      `font-size:${sqrtPt}pt;font-weight:normal;`;
+    const radStyle =
+      `padding:0 !important;` +
+      `border-top:${VINCULUM};border-left:0;border-right:0;border-bottom:0;` +
+      `line-height:1;white-space:nowrap;` +
+      `text-align:center;vertical-align:middle;` +
+      `font-family:${CELL_FONT_FAMILY};` +
+      `font-size:${pt}pt;font-weight:normal;`;
+    return (
+      `<table width="${totalW}" style="border-collapse:collapse;` +
+      `width:${totalW}px;">` +
+      `<tr>` +
+      `<td valign="middle" align="center" width="${glyphW}" height="1" ` +
+      `style="${glyphStyle}">` +
+      `<span style="font-size:${sqrtPt}pt;line-height:1;">√</span></td>` +
+      `<td valign="middle" align="center" width="${contentW}" height="1" ` +
+      `style="${radStyle}">` +
+      `<span style="font-size:${pt}pt;line-height:1;">${contentHTML}</span></td>` +
+      `</tr></table>`
+    );
+  }
+
   // Nested fallback for sequences the flat builders can't handle —
   // typically 2+ structural blocks with differing row counts (cases +
   // bmatrix, bmatrix + bmatrix, etc). Renders each part as its own
@@ -1495,10 +1594,13 @@
       const m = /<table\s+width="(\d+)"/.exec(html);
       return m ? parseInt(m[1], 10) : 0;
     };
+    const countTR = (html) => (html.match(/<tr\b/gi) || []).length;
 
-    const cells = [];
-    let totalW = 0;
-
+    // Pass 1: build each part's inner HTML + measured width, and record
+    // its rendered pt-height. Single pass was losing the per-part height
+    // info needed to compute outerH (the row's max content height) and
+    // pad shorter cells to match.
+    const built = [];
     for (const part of parts) {
       if (part.kind === "text") {
         const valueHTML = part.valueHTML || part.value;
@@ -1506,32 +1608,25 @@
         setRichFont(textPt);
         const contentPx = richMeasure(stripHTMLTags(valueHTML));
         const w = cellWidthPx(contentPx, textPt, MATRIX_TEXT_SIBLING_PAD_EM);
-        totalW += w;
-        const style =
-          `padding:0 !important;border:none;white-space:nowrap;` +
-          `line-height:1.15;text-align:center;vertical-align:middle;` +
-          `font-family:${CELL_FONT_FAMILY};font-size:${textPt}pt;` +
-          `font-weight:normal;${dbg("#0cc")}`;
-        cells.push(
-          `<td valign="middle" align="center" width="${w}" height="1" ` +
-          `style="${style}">${valueHTML}</td>`
-        );
+        // line-height:1.15 (set on the cell) makes the rendered text
+        // strut 1.15× the font size — outerH math must match.
+        built.push({
+          kind: "text",
+          inner: valueHTML, w, hPt: textPt * 1.15,
+        });
       } else if (part.kind === "sqrt") {
-        const c = part.contentHTML || part.content || "";
-        const v = "√(" + c + ")";
-        setRichFont(mathPt);
-        const contentPx = richMeasure(stripHTMLTags(v));
-        const w = cellWidthPx(contentPx, mathPt, MATRIX_TEXT_SIBLING_PAD_EM);
-        totalW += w;
-        const style =
-          `padding:0 !important;border:none;white-space:nowrap;` +
-          `line-height:1.15;text-align:center;vertical-align:middle;` +
-          `font-family:${CELL_FONT_FAMILY};font-size:${mathPt}pt;` +
-          `font-weight:normal;${dbg("#0cc")}`;
-        cells.push(
-          `<td valign="middle" align="center" width="${w}" height="1" ` +
-          `style="${style}">${v}</td>`
+        const inner = buildSqrtInnerHTML(
+          part.contentHTML || part.content || "",
+          mathPt
         );
+        const w = parseW(inner);
+        // Single row at sqrtPt (= mathPt × 1.4, matching the default
+        // glyphScale in buildSqrtInnerHTML). The √ glyph sets the row
+        // height; the radicand centers inside it below the vinculum.
+        built.push({
+          kind: "sqrt",
+          inner, w, hPt: mathPt * 1.4,
+        });
       } else if (part.kind === "fraction") {
         const inner = buildFractionInnerHTML(
           part.numHTML || part.num,
@@ -1539,14 +1634,11 @@
           mathPt
         );
         const w = parseW(inner);
-        totalW += w;
-        const style =
-          `padding:0 !important;border:none;line-height:1;` +
-          `text-align:center;vertical-align:middle;${dbg("#a0f")}`;
-        cells.push(
-          `<td valign="middle" align="center" width="${w}" ` +
-          `style="${style}">${inner}</td>`
-        );
+        // Fraction is 2 rows at line-height:1 × mathPt each.
+        built.push({
+          kind: "fraction",
+          inner, w, hPt: mathPt * 2,
+        });
       } else if (part.kind === "choose") {
         const full = buildChooseHTML(
           part.numHTML || part.num,
@@ -1555,14 +1647,10 @@
         );
         const inner = stripMeta(full);
         const w = parseW(full);
-        totalW += w;
-        const style =
-          `padding:0 !important;border:none;line-height:1;` +
-          `text-align:center;vertical-align:middle;${dbg("#a0f")}`;
-        cells.push(
-          `<td valign="middle" align="center" width="${w}" ` +
-          `style="${style}">${inner}</td>`
-        );
+        built.push({
+          kind: "choose",
+          inner, w, hPt: mathPt * 2,
+        });
       } else if (part.kind === "matrix") {
         const full = part.style === "cases"
           ? buildCasesHTML(part.rows, sourcePt, part.rowsHTML, part.rowsParts)
@@ -1574,34 +1662,103 @@
               part.rowsParts
             );
         const inner = stripMeta(full);
-        // True matrices (not cases) get nudged right inside their
-        // purple wrapper cell via padding-left. An earlier attempt
-        // nested a table `[spacer | matrix]` inside the wrapper, but
-        // the nested table's border-collapse context clipped the
-        // matrix's left bracket stroke to a thinner line. Using
-        // padding on the wrapper <td> keeps the matrix table alone
-        // inside, so its bracket borders render at full thickness.
-        // Cases keep their natural centering (brace-on-left already
-        // provides the visual offset a bracketed matrix lacks).
-        const isMatrix = part.style !== "cases";
-        const MATRIX_LEFT_SHIFT = isMatrix ? 2 : 0;
-        const MATRIX_RIGHT_SHIFT = isMatrix ? 2 : 0;
         const baseW = parseW(full);
-        // Content-box: declared width is content area, padding adds on
-        // top visually. totalW is visual (what the outer table sums).
-        // Cases cell is 1px narrower than matrices' centering slack so
-        // the right margin sits closer to the next part.
-        const w = baseW + (isMatrix ? 3 : 2);
-        totalW += w + MATRIX_LEFT_SHIFT + MATRIX_RIGHT_SHIFT;
-        const padStyle = (MATRIX_LEFT_SHIFT || MATRIX_RIGHT_SHIFT)
-          ? `padding:0 ${MATRIX_RIGHT_SHIFT}px 0 ${MATRIX_LEFT_SHIFT}px !important;`
-          : `padding:0 !important;`;
+        const isMatrix = part.style !== "cases";
+        // Count actual <tr> in the built HTML — cases mixes text rows
+        // and fraction rows (2 outer rows per fraction), so inferring
+        // from part.rows alone would miss that.
+        const rows = countTR(inner);
+        // Matrix value cells use line-height:1, so rows × mathPt is
+        // exact. Cases value cells use line-height:1.15, plus the
+        // oversized `{` brace can stretch the block past the row sum
+        // (bracePt floor matches the formula in buildCasesHTML).
+        let hPt;
+        if (isMatrix) {
+          hPt = rows * mathPt;
+        } else {
+          const rowsHeight = rows * mathPt * 1.15;
+          // Mirrors the brace size in buildCasesHTML.
+          const bracePt = Math.max(mathPt * 1.8, mathPt * rows * 1.1);
+          hPt = Math.max(rowsHeight, bracePt);
+        }
+        built.push({
+          kind: "matrix",
+          isMatrix,
+          inner,
+          w: baseW + (isMatrix ? 3 : 2),
+          hPt,
+        });
+      }
+    }
+
+    if (!built.length) return null;
+
+    // outerH = tallest cell's content height. Shorter cells get vertical
+    // padding to match, which — with !important — survives the Docs
+    // paste importer's padding strip well enough to visibly center them
+    // in the row next to a tall `cases` or `matrix` neighbor.
+    const maxHpt = built.reduce((m, b) => Math.max(m, b.hPt), 0);
+    const outerH = Math.ceil(maxHpt * PT_TO_PX);
+
+    const cells = [];
+    let totalW = 0;
+    for (const b of built) {
+      const ihpx = Math.ceil(b.hPt * PT_TO_PX);
+      const tp = Math.max(0, Math.floor((outerH - ihpx) / 2));
+      const bp = Math.max(0, outerH - ihpx - tp);
+
+      if (b.kind === "text") {
+        totalW += b.w;
+        const style =
+          `padding:${tp}px 0 ${bp}px 0 !important;border:none;white-space:nowrap;` +
+          `line-height:1.15;text-align:center;vertical-align:middle;` +
+          `font-family:${CELL_FONT_FAMILY};font-size:${textPt}pt;` +
+          `font-weight:normal;${dbg("#0cc")}`;
+        cells.push(
+          `<td valign="middle" align="center" width="${b.w}" height="1" ` +
+          `style="${style}">${b.inner}</td>`
+        );
+      } else if (b.kind === "sqrt") {
+        totalW += b.w;
+        // inner is a nested table now (strut-killed glyph row + vinculum
+        // + radicand) — strut-kill the wrapper cell too so the outer's
+        // text strut doesn't add extra vertical space around the sqrt.
+        const style =
+          `padding:${tp}px 0 ${bp}px 0 !important;border:none;line-height:0;` +
+          `font-size:0;text-align:center;vertical-align:middle;${dbg("#0cc")}`;
+        cells.push(
+          `<td valign="middle" align="center" width="${b.w}" ` +
+          `style="${style}">${b.inner}</td>`
+        );
+      } else if (b.kind === "fraction" || b.kind === "choose") {
+        totalW += b.w;
+        const style =
+          `padding:${tp}px 0 ${bp}px 0 !important;border:none;line-height:1;` +
+          `text-align:center;vertical-align:middle;${dbg("#a0f")}`;
+        cells.push(
+          `<td valign="middle" align="center" width="${b.w}" ` +
+          `style="${style}">${b.inner}</td>`
+        );
+      } else if (b.kind === "matrix") {
+        // True matrices (not cases) get nudged right inside their
+        // purple wrapper cell via padding-left. Using padding on the
+        // wrapper <td> (rather than a nested `[spacer | matrix]`
+        // table) keeps the matrix table alone inside, so its bracket
+        // borders render at full thickness. Cases keep natural
+        // centering — brace-on-left already provides the visual offset
+        // a bracketed matrix lacks.
+        const MATRIX_LEFT_SHIFT = b.isMatrix ? 2 : 0;
+        const MATRIX_RIGHT_SHIFT = b.isMatrix ? 2 : 0;
+        totalW += b.w + MATRIX_LEFT_SHIFT + MATRIX_RIGHT_SHIFT;
+        const padStyle =
+          `padding:${tp}px ${MATRIX_RIGHT_SHIFT}px ${bp}px ` +
+          `${MATRIX_LEFT_SHIFT}px !important;`;
         const style =
           `${padStyle}border:none;line-height:1;` +
           `text-align:center;vertical-align:middle;${dbg("#a0f")}`;
         cells.push(
-          `<td valign="middle" align="center" width="${w}" ` +
-          `style="${style}">${inner}</td>`
+          `<td valign="middle" align="center" width="${b.w}" ` +
+          `style="${style}">${b.inner}</td>`
         );
       }
     }
@@ -1659,6 +1816,11 @@
       } else {
         html = buildMatrixHTML(rich.rows, rich.style, sourcePt, rich.rowsHTML, rich.rowsParts);
       }
+    } else if (rich.kind === "sqrt") {
+      const pt = resolveRenderPt(sourcePt);
+      html =
+        `<meta charset="utf-8">` +
+        buildSqrtInnerHTML(rich.contentHTML || rich.content || "", pt);
     } else if (rich.kind === "sequence") {
       html = buildSequenceHTML(rich.parts, sourcePt);
     } else if (rich.kind === "text") {
