@@ -1,11 +1,11 @@
 <p align="center">
-  <img src="logo.png" alt="docslatex" width="100" />
+  <img src="assets/logo.png" alt="docslatex" width="100" />
 </p>
 
 <h1 align="center" style="font-size: 3em;">docslatex</h1>
 
 <p align="center">
-  <a href="#usage">Usage</a> · <a href="#getting-started">Getting Started</a> · <a href="LICENSE">License</a>
+  <a href="#usage">Usage</a> · <a href="#getting-started">Getting Started</a> · <a href="https://github.com/Peter-Zhao-751/docslatex/archive/refs/heads/main.zip">Download ZIP</a> · <a href="LICENSE">License</a>
 </p>
 
 <p align="center">
@@ -43,8 +43,9 @@ Wrap your LaTeX in delimiters and let docslatex handle the rest:
 ---
 
 ### Getting started
-1. Install the extension
-2. Open any Google Doc
-3. Click the docslatex icon and hit **Enable**
-4. Write LaTeX between `\( \)` or `\[ \]`
-5. Toggle **Autocompile** for hands-free conversion, or use the compile button
+1. [Download the ZIP](https://github.com/Peter-Zhao-751/docslatex/archive/refs/heads/main.zip) and unzip it
+2. In Chrome, go to `chrome://extensions`, enable **Developer mode**, click **Load unpacked**, and select the unzipped folder
+3. Open any Google Doc
+4. Click the docslatex icon and hit **Enable**
+5. Write LaTeX between `\( \)` or `\[ \]`
+6. Toggle **Autocompile** for hands-free conversion, or use the compile button

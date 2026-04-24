@@ -143,17 +143,8 @@
   // directly next to a matrix (or a cases block). Zero would leave the
   // `+`/`=` glyph touching the bracket/brace, which reads cramped;
   // this tiny pad unsticks them without introducing an obvious gutter.
-  // Non-matrix sequences stick with SEQ_TEXT_PAD_EM (=0) since their
-  // text sits next to a fraction bar / open space, not a bracket edge.
   const MATRIX_TEXT_SIBLING_PAD_EM = 0.08;
   const TEXT_SIDE_PAD_EM = 0.15 + CELL_SAFETY_EM;
-  // Text cells in any sequence builder are measured to their exact
-  // rendered width — no side slack. Keeps text flush against adjacent
-  // structural blocks (matrix bracket, fraction bar, cases brace) and
-  // matches what structural cells do (parseW → inner table's declared
-  // width, no extra), so every cell type follows the same "natural
-  // width" rule instead of each kind having its own gutter constant.
-  const SEQ_TEXT_PAD_EM = 0;
 
   // Font-family pinned on every cell we emit. Measurements happen in
   // Arial on our scratch canvas, so forcing the rendered font to Arial
@@ -162,6 +153,26 @@
 
   // Rendered math renders at the same size as the surrounding text.
   const SIZE_FACTOR = 1.0;
+
+  // Fraction variant → font scale for numerator/denominator, relative
+  // to body text. LaTeX semantics:
+  //   \frac        — defaults to displaystyle in display math, textstyle
+  //                  inline. We always render displaystyle for Docs
+  //                  readability, so 1.0.
+  //   \dfrac       — forced displaystyle. 1.0.
+  //   \cfrac       — continued-fraction, always displaystyle. 1.0.
+  //   \tfrac       — forced textstyle: num/den set in scriptstyle,
+  //                  which is ~70% of body in a real LaTeX build.
+  const FRAC_VARIANT_SCALE = {
+    frac: 1.0,
+    dfrac: 1.0,
+    cfrac: 1.0,
+    tfrac: 0.7,
+  };
+  function fracVariantPt(pt, variant) {
+    const scale = FRAC_VARIANT_SCALE[variant] || 1.0;
+    return Math.max(4, pt * scale);
+  }
 
   // When Debug is on in the popup, every cell we emit draws a dashed
   // outline so we can see what Docs' paste importer actually keeps
@@ -238,18 +249,19 @@
   // numHTML/denHTML may contain native <sub>/<sup> tags; we strip
   // them for measurement but pass them through as cell content so
   // Docs' paste importer picks up the subscript/superscript formatting.
-  function buildFractionInnerHTML(numHTML, denHTML, pt) {
-    setRichFont(pt);
+  function buildFractionInnerHTML(numHTML, denHTML, pt, variant) {
+    const fpt = fracVariantPt(pt, variant);
+    setRichFont(fpt);
     const contentPx = Math.max(
       richMeasure(stripHTMLTags(numHTML)),
       richMeasure(stripHTMLTags(denHTML))
     );
-    const w = cellWidthPx(contentPx, pt, FRAC_SIDE_PAD_EM);
-    const baseStyle = mathCellStyle(pt, "#f00");
+    const w = cellWidthPx(contentPx, fpt, FRAC_SIDE_PAD_EM);
+    const baseStyle = mathCellStyle(fpt, "#f00");
     const cell = (c, rule) =>
       `<td align="center" width="${w}" height="1" style="${baseStyle}` +
       (rule ? "border-top:0.75pt solid #000;" : "") +
-      `">${richPara(pt, c)}</td>`;
+      `">${richPara(fpt, c)}</td>`;
     // Table width pinned explicitly to the cell width (both the HTML
     // attribute and the CSS property). The previous `width:1px`
     // shrink-to-fit trick works in a normal browser but Docs' paste
@@ -266,9 +278,95 @@
     );
   }
 
-  function buildFractionHTML(numHTML, denHTML, sourcePt) {
+  function buildFractionHTML(numHTML, denHTML, sourcePt, variant) {
     const pt = resolveRenderPt(sourcePt);
-    return `<meta charset="utf-8">${buildFractionInnerHTML(numHTML, denHTML, pt)}`;
+    return `<meta charset="utf-8">${buildFractionInnerHTML(numHTML, denHTML, pt, variant)}`;
+  }
+
+  // `\sqrt{x}` — 1×2 table: oversized `√` glyph on the left, radicand
+  // on the right with a `border-top` vinculum. Same pattern as the
+  // fraction bar: border-collapse:collapse makes the glyph's top bar
+  // and the radicand's top border visually share the same line across
+  // the cell boundary. vertical-align:top pins the glyph top (and its
+  // built-in horizontal stroke) to the row's top edge so it lines up
+  // with the radicand's border-top.
+  //
+  // The √ glyph is scaled 1.4× body pt so its height reaches the top
+  // of a normal-sized radicand row. Too large and the hook descends
+  // below the baseline, inflating row height in a Docs cell.
+  // `\sqrt{x}` — 2×2 table. Row 1 is a minimal spacer (~1pt tall)
+  // that gives the vinculum (row 2's border-top) an adjacent row to
+  // draw against under `border-collapse:collapse`. Row 2 has the `√`
+  // glyph (left) and the radicand (right, with `border-top` as the
+  // vinculum). The glyph cell uses vertical-align:bottom so the √
+  // baseline aligns with the radicand; since the √ is taller than
+  // the radicand, row 2 stretches to the glyph's height, putting the
+  // glyph's top stroke at the row-2 top edge — which is exactly
+  // where the border-top vinculum draws.
+  function buildSqrtInnerHTML(contentHTML, pt, glyphScale) {
+    // Caller can shrink the √ glyph via glyphScale. When the nested
+    // sqrt is embedded as a single cell inside a 2-row outer sequence
+    // table (see buildSequenceHTML), the nested table's total height
+    // must match the sibling fraction's row heights — otherwise Docs
+    // stretches the outer rows to fit the oversized glyph, pushing
+    // the fraction's num and den far apart. Passing glyphScale=1
+    // keeps the √ at body pt so the nested sqrt is dimensionally
+    // identical to a flat fraction.
+    const sqrtPt = Math.max(4, pt * (glyphScale || 1.4));
+    setRichFont(pt);
+    const contentPx = richMeasure(stripHTMLTags(contentHTML));
+    // +1px so the overline has a small right-side tail past the
+    // radicand, matching LaTeX's vinculum overhang and avoiding a
+    // flush-right look when followed by inline content.
+    const contentW = cellWidthPx(contentPx, pt, FRAC_SIDE_PAD_EM) + 1;
+    setRichFont(sqrtPt);
+    const glyphW = cellWidthPx(richMeasure("√"), sqrtPt, 0);
+    const totalW = glyphW + contentW;
+    // Spacer row kept vestigially for the border-top to draw against,
+    // but sized to ~1pt so it doesn't inflate the sqrt's overall
+    // height. The old `pt`-sized spacer was there to align with a
+    // sibling fraction's numerator row in the flat layout; now that
+    // sqrt renders as its own nested table, that alignment is handled
+    // by the outer cell's vertical-align:middle instead.
+    const SPACER_PT = 1;
+    const spacerStyle =
+      `padding:0 !important;border:none;line-height:1;` +
+      `font-family:${CELL_FONT_FAMILY};font-size:${SPACER_PT}pt;` +
+      `font-weight:normal;${dbg("#0af")}`;
+    const glyphStyle =
+      `padding:0 !important;border:none;line-height:1;` +
+      `white-space:nowrap;text-align:center;vertical-align:bottom;` +
+      `font-family:${CELL_FONT_FAMILY};font-size:${sqrtPt}pt;` +
+      `font-weight:normal;${dbg("#0af")}`;
+    // border-top MUST come after dbg() — dbg returns `border:0;` in
+    // non-debug mode, a shorthand that would otherwise clobber any
+    // earlier border-top. Same ordering trick buildFractionInnerHTML
+    // uses for the fraction bar.
+    const radStyle =
+      `padding:0 !important;line-height:1;` +
+      `white-space:nowrap;text-align:center;vertical-align:bottom;` +
+      `font-family:${CELL_FONT_FAMILY};font-size:${pt}pt;` +
+      `font-weight:normal;${dbg("#0af")}` +
+      `border-top:0.75pt solid #000;`;
+    return (
+      `<table width="${totalW}" style="border-collapse:collapse;border:none;` +
+      `table-layout:auto;width:${totalW}px;">` +
+      `<tr>` +
+      `<td width="${glyphW}" height="1" style="${spacerStyle}">&nbsp;</td>` +
+      `<td width="${contentW}" height="1" style="${spacerStyle}">&nbsp;</td>` +
+      `</tr>` +
+      `<tr>` +
+      `<td align="center" width="${glyphW}" height="1" style="${glyphStyle}">` +
+      `<span style="font-size:${sqrtPt}pt;line-height:1;">√</span></td>` +
+      `<td align="center" width="${contentW}" height="1" style="${radStyle}">` +
+      `<span style="font-size:${pt}pt;line-height:1;">${contentHTML}</span></td>` +
+      `</tr></table>`
+    );
+  }
+
+  function buildSqrtHTML(contentHTML, sourcePt) {
+    const pt = resolveRenderPt(sourcePt);
+    return `<meta charset="utf-8">${buildSqrtInnerHTML(contentHTML, pt)}`;
   }
 
   // Binomial coefficient `\binom{n}{k}` / `{n \choose k}`: a 3-col ×
@@ -289,7 +387,14 @@
       richMeasure(stripHTMLTags(numHTML)),
       richMeasure(stripHTMLTags(denHTML))
     );
-    const w = cellWidthPx(contentPx, pt, FRAC_SIDE_PAD_EM);
+    // FRAC_SIDE_PAD_EM alone can land under Docs' render width for
+    // short content like `j-1`/`i-1` — the canvas-vs-render drift is
+    // a pixel or two but `table-layout:fixed` means under-by-one wraps
+    // the num/den onto two lines. +2px is the minimum buffer that
+    // tips the declared width above render without visibly inflating
+    // the right margin (previously adding full CELL_SAFETY_EM here
+    // added ~3.6px which read as excess padding).
+    const w = cellWidthPx(contentPx, pt, FRAC_SIDE_PAD_EM) + 2;
     const contentStyle = mathCellStyle(pt, "#f0f");
     const contentCell = (c) =>
       `<td align="center" width="${w}" height="1" style="${contentStyle}">` +
@@ -321,10 +426,11 @@
     const totalW = parenW * 2 + w;
     return (
       `<meta charset="utf-8">` +
-      `<table width="${totalW}" style="border-collapse:collapse;border:none;` +
+      `<table width="${totalW}" cellspacing="0" cellpadding="0" ` +
+      `style="border-collapse:collapse;border:none;margin:0;padding:0;` +
       `table-layout:fixed;width:${totalW}px;">` +
-      `<tr>${parenCell("(")}${contentCell(numHTML)}${parenCell(")")}</tr>` +
-      `<tr>${contentCell(denHTML)}</tr>` +
+      `<tr height="1">${parenCell("(")}${contentCell(numHTML)}${parenCell(")")}</tr>` +
+      `<tr height="1">${contentCell(denHTML)}</tr>` +
       `</table>`
     );
   }
@@ -413,16 +519,17 @@
       } else if (part.kind === "fraction") {
         const numHTML = part.numHTML || part.num;
         const denHTML = part.denHTML || part.den;
-        setRichFont(pt);
+        const fpt = fracVariantPt(pt, part.variant);
+        setRichFont(fpt);
         const contentPx = Math.max(
           richMeasure(stripHTMLTags(numHTML)),
           richMeasure(stripHTMLTags(denHTML))
         );
-        const w = cellWidthPx(contentPx, pt, FRAC_SIDE_PAD_EM);
+        const w = cellWidthPx(contentPx, fpt, FRAC_SIDE_PAD_EM);
         totalW += w;
-        const numStyle = mathCellStyle(pt, "#f00");
+        const numStyle = mathCellStyle(fpt, "#f00");
         const denStyle =
-          mathCellStyle(pt, "#f00") + "border-top:0.75pt solid #000;";
+          mathCellStyle(fpt, "#f00") + "border-top:0.75pt solid #000;";
         topCells.push(
           `<td align="center" width="${w}" height="1" style="${numStyle}">` +
           numHTML + `</td>`
@@ -585,7 +692,7 @@
           `<td width="${BRACKET_CELL_W}" style="${bracketCellStyle(r, "R")}">&nbsp;</td>`
         );
       }
-      trHTML.push(`<tr>${tds.join("")}</tr>`);
+      trHTML.push(`<tr height="1">${tds.join("")}</tr>`);
     }
 
     // Pin the table to exactly the sum of its cell widths, same
@@ -604,7 +711,8 @@
 
     return (
       `<meta charset="utf-8">` +
-      `<table width="${totalW}" style="border-collapse:collapse;` +
+      `<table width="${totalW}" cellspacing="0" cellpadding="0" ` +
+      `style="border-collapse:collapse;margin:0;padding:0;` +
       `width:${totalW}px;">` +
       trHTML.join("") +
       `</table>`
@@ -681,28 +789,29 @@
         hasStructure = true;
         const numHTML = part.numHTML || part.num;
         const denHTML = part.denHTML || part.den;
-        setRichFont(pt);
+        const fpt = fracVariantPt(pt, part.variant);
+        setRichFont(fpt);
         const w = cellWidthPx(
           Math.max(
             richMeasure(stripHTMLTags(numHTML)),
             richMeasure(stripHTMLTags(denHTML))
           ),
-          pt,
+          fpt,
           FRAC_SIDE_PAD_EM
         );
         totalW += w;
-        const numStyle = mathCellStyle(pt, "#f00");
+        const numStyle = mathCellStyle(fpt, "#f00");
         const denStyle =
-          mathCellStyle(pt, "#f00") + "border-top:0.75pt solid #000;";
+          mathCellStyle(fpt, "#f00") + "border-top:0.75pt solid #000;";
         topCells.push({
-          html: richPara(pt, numHTML),
+          html: richPara(fpt, numHTML),
           width: w,
           style: numStyle,
           align: "center",
           rowspanStructural: 1,
         });
         bottomCells.push({
-          html: richPara(pt, denHTML),
+          html: richPara(fpt, denHTML),
           width: w,
           style: denStyle,
           align: "center",
@@ -712,13 +821,18 @@
         const numHTML = part.numHTML || part.num;
         const denHTML = part.denHTML || part.den;
         setRichFont(pt);
+        // CELL_SAFETY_EM on top of FRAC_SIDE_PAD_EM — cases outer table
+        // is auto-layout (not fixed) so Docs sometimes undersizes a
+        // choose's num/den column, letting `j-1` wrap mid-word. The
+        // safety slack covers the Arial-canvas vs Docs-render font
+        // drift that the tight frac pad alone doesn't absorb.
         const contentW = cellWidthPx(
           Math.max(
             richMeasure(stripHTMLTags(numHTML)),
             richMeasure(stripHTMLTags(denHTML))
           ),
           pt,
-          FRAC_SIDE_PAD_EM
+          FRAC_SIDE_PAD_EM + CELL_SAFETY_EM
         );
         const parenPt = pt * 1.9;
         setRichFont(parenPt);
@@ -845,11 +959,11 @@
           continue;
         }
         setRichFont(pt);
-        const w = cellWidthPx(
-          richMeasure(stripHTMLTags(html)),
-          pt,
-          MATRIX_SIDE_PAD_EM
-        );
+        // Condition cell is text-left aligned — cell width beyond text
+        // becomes trailing whitespace on the right. Keep the right
+        // buffer minimal (~1/5 of the previous ~4-5px MATRIX_SIDE_PAD
+        // slack) so the cases right margin stays tight.
+        const w = Math.ceil(richMeasure(stripHTMLTags(html))) + 1;
         condParts.push({ html: richPara(pt, html), width: w, style: null });
         if (w > condW) condW = w;
       }
@@ -865,11 +979,15 @@
     setRichFont(bracePt);
     const braceW = cellWidthPx(richMeasure("{"), bracePt, 0);
 
+    // Cell strut killed via font-size:0/line-height:0 — otherwise the
+    // large bracePt on the cell inflates the rowspan-cell's implicit
+    // strut to bracePt tall, stretching the cases rows beyond their
+    // content height. The visible `{` glyph is emitted by the inner
+    // <span> at bracePt, so the cell can safely have zero strut.
     const braceStyle =
-      `padding:0 !important;border:none;line-height:1;white-space:nowrap;` +
-      `text-align:center;vertical-align:middle;` +
-      `font-family:${CELL_FONT_FAMILY};` +
-      `font-size:${bracePt}pt;font-weight:normal;` +
+      `padding:0 !important;border:none;font-size:0;line-height:0;` +
+      `white-space:nowrap;text-align:center;vertical-align:middle;` +
+      `font-family:${CELL_FONT_FAMILY};font-weight:normal;` +
       dbg("#fa0");
     const condStyle = mathCellStyle(pt, "#fa0", "left");
 
@@ -929,7 +1047,7 @@
           `width="${condW}" style="${condStyle}">${cond.html}</td>`
         );
       }
-      trHTML.push(`<tr>${topTDs.join("")}</tr>`);
+      trHTML.push(`<tr height="1">${topTDs.join("")}</tr>`);
 
       // BOTTOM row (only when this cases-row has structure).
       if (s.hasStructure) {
@@ -937,14 +1055,15 @@
         for (const cell of s.bottomCells) {
           botTDs.push(tdHTML(cell, 1));
         }
-        trHTML.push(`<tr>${botTDs.join("")}</tr>`);
+        trHTML.push(`<tr height="1">${botTDs.join("")}</tr>`);
       }
     }
 
     const totalW = braceW + valueW + condW;
     return (
       `<meta charset="utf-8">` +
-      `<table width="${totalW}" style="border-collapse:collapse;border:none;` +
+      `<table width="${totalW}" cellspacing="0" cellpadding="0" ` +
+      `style="border-collapse:collapse;border:none;margin:0;padding:0;` +
       `table-layout:auto;width:${totalW}px;">` +
       trHTML.join("") +
       `</table>`
@@ -991,114 +1110,23 @@
       return buildNestedSequenceHTML(parts, sourcePt);
     }
 
-    const textPt = sourcePt || 11;
-    const mathPt = resolveRenderPt(sourcePt);
-
-    let hasStructure = false;
-    const topCells = [];
-    const bottomCells = [];
-    let totalW = 0;
-
-    for (const part of parts) {
-      if (part.kind === "text") {
-        const valueHTML = part.valueHTML || part.value;
-        if (!valueHTML) continue;
-        setRichFont(textPt);
-        const contentPx = richMeasure(stripHTMLTags(valueHTML));
-        const w = cellWidthPx(contentPx, textPt, SEQ_TEXT_PAD_EM);
-        totalW += w;
-        // line-height:1.15 (not 1): Unicode subscript glyphs like ᵢ
-        // sit below the baseline and get clipped by a cell bottom
-        // set exactly to the font size. A small leading fixes that
-        // without inflating the row much. Font-family and font-size
-        // pinned on the <td> for the same reason as math cells (Docs
-        // may strip inline span styles).
-        const style =
-          `padding:0 !important;border:none;white-space:nowrap;` +
-          `line-height:1.15;` +
-          `text-align:center;` +
-          `vertical-align:middle;` +
-          `font-family:${CELL_FONT_FAMILY};` +
-          `font-size:${textPt}pt;` +
-          `font-weight:normal;${dbg("#0cc")}`;
-        topCells.push(
-          `<td rowspan="2" valign="middle" align="center" width="${w}" ` +
-          `height="1" style="${style}">${valueHTML}</td>`
-        );
-      } else if (part.kind === "fraction") {
-        hasStructure = true;
-        const numHTML = part.numHTML || part.num;
-        const denHTML = part.denHTML || part.den;
-        setRichFont(mathPt);
-        const contentPx = Math.max(
-          richMeasure(stripHTMLTags(numHTML)),
-          richMeasure(stripHTMLTags(denHTML))
-        );
-        const w = cellWidthPx(contentPx, mathPt, FRAC_SIDE_PAD_EM);
-        totalW += w;
-        const numStyle = mathCellStyle(mathPt, "#f00");
-        const denStyle =
-          mathCellStyle(mathPt, "#f00") + "border-top:0.75pt solid #000;";
-        topCells.push(
-          `<td align="center" width="${w}" height="1" style="${numStyle}">` +
-          numHTML +
-          `</td>`
-        );
-        bottomCells.push(
-          `<td align="center" width="${w}" height="1" style="${denStyle}">` +
-          denHTML +
-          `</td>`
-        );
-      } else if (part.kind === "choose") {
-        hasStructure = true;
-        const numHTML = part.numHTML || part.num;
-        const denHTML = part.denHTML || part.den;
-        setRichFont(mathPt);
-        const contentPx = Math.max(
-          richMeasure(stripHTMLTags(numHTML)),
-          richMeasure(stripHTMLTags(denHTML))
-        );
-        const contentW = cellWidthPx(contentPx, mathPt, FRAC_SIDE_PAD_EM);
-        const parenPt = mathPt * 1.9;
-        setRichFont(parenPt);
-        const parenGlyphPx = Math.max(richMeasure("("), richMeasure(")"));
-        const parenW = cellWidthPx(parenGlyphPx, parenPt, 0.05);
-        totalW += parenW * 2 + contentW;
-        const contentStyle = mathCellStyle(mathPt, "#f0f");
-        const parenStyle =
-          `padding:0 !important;border:none;line-height:1;` +
-          `white-space:nowrap;text-align:center;vertical-align:middle;` +
-          `font-family:${CELL_FONT_FAMILY};font-size:${parenPt}pt;` +
-          `font-weight:normal;${dbg("#f0f")}`;
-        topCells.push(
-          `<td rowspan="2" valign="middle" align="center" width="${parenW}" ` +
-          `style="${parenStyle}">` +
-          `<span style="font-size:${parenPt}pt;line-height:1;">(</span></td>` +
-          `<td align="center" width="${contentW}" height="1" style="${contentStyle}">` +
-          numHTML + `</td>` +
-          `<td rowspan="2" valign="middle" align="center" width="${parenW}" ` +
-          `style="${parenStyle}">` +
-          `<span style="font-size:${parenPt}pt;line-height:1;">)</span></td>`
-        );
-        bottomCells.push(
-          `<td align="center" width="${contentW}" height="1" style="${contentStyle}">` +
-          denHTML + `</td>`
-        );
-      }
+    // No-matrix sequences (sqrt/fraction/choose + text): delegate to
+    // the nested builder. Earlier this path flattened everything into
+    // a single 2-row outer table (fraction num in row 1, den in row
+    // 2; sqrt glyph + radicand as separate columns) to share rows
+    // with sibling fractions for bar alignment — but that split each
+    // structural block across multiple outer cells, so a sqrt read as
+    // "√ | 5" (two visual boxes) while a fraction read as one stacked
+    // block, inconsistent. The nested path wraps every structural
+    // block in its own outer cell with a nested inner table, so each
+    // block reads as one unified unit and the overall layout is
+    // uniform whether or not there's a matrix in the mix.
+    if (!parts.some(
+      (p) => p.kind === "fraction" || p.kind === "choose" || p.kind === "sqrt"
+    )) {
+      return null;
     }
-
-    if (!hasStructure) return null;
-
-    // Pin the table to the sum of cell widths so Docs' paste importer
-    // doesn't stretch it to paragraph width and dump the excess into
-    // whichever column has no content-width floor (the text cells).
-    return (
-      `<meta charset="utf-8">` +
-      `<table width="${totalW}" style="border-collapse:collapse;border:none;width:${totalW}px;">` +
-      `<tr>${topCells.join("")}</tr>` +
-      `<tr>${bottomCells.join("")}</tr>` +
-      `</table>`
-    );
+    return buildNestedSequenceHTML(parts, sourcePt);
   }
 
   // Flat rendering for sequences with a matrix: the outer table grows to
@@ -1258,7 +1286,7 @@
           ? inner.html
           : richPara(mathPt, inner.html);
         const style = inner.structural
-          ? `padding:0 !important;border:none;line-height:1;` +
+          ? `padding:0 !important;border:none;font-size:0;line-height:0;` +
             `text-align:center;vertical-align:middle;${dbg("#a0f")}`
           : `padding:0 !important;border:none;white-space:nowrap;` +
             `line-height:1.15;text-align:center;vertical-align:middle;` +
@@ -1271,10 +1299,11 @@
       }
     }
 
-    const trHTML = rowsCells.map((tds) => `<tr>${tds.join("")}</tr>`).join("");
+    const trHTML = rowsCells.map((tds) => `<tr height="1">${tds.join("")}</tr>`).join("");
     return (
       `<meta charset="utf-8">` +
-      `<table width="${totalW}" style="border-collapse:collapse;border:none;` +
+      `<table width="${totalW}" cellspacing="0" cellpadding="0" ` +
+      `style="border-collapse:collapse;border:none;margin:0;padding:0;` +
       `width:${totalW}px;">` +
       trHTML +
       `</table>`
@@ -1300,6 +1329,18 @@
     }
     if (parts.some((p) => p.kind === "matrix" && p.style !== "cases")) {
       LOG("cases-seq: bail (non-cases matrix mixed in)");
+      return null;
+    }
+    // Bail when there are any sibling parts alongside the cases. Flat
+    // layout (each part as columns in the same outer table) lets a
+    // sibling fraction's 2-row natural height stretch the cases rows,
+    // producing a huge vertical gap between the cases text rows. The
+    // nested fallback (buildNestedSequenceHTML) renders the cases as
+    // its own inner table inside one outer cell — same pattern as a
+    // fraction sibling — so each structural block keeps its natural
+    // height independent of its neighbors.
+    if (parts.some((p) => p.kind !== "matrix")) {
+      LOG("cases-seq: bail (has non-matrix siblings — defer to nested)");
       return null;
     }
 
@@ -1354,28 +1395,19 @@
     }
     const hasCondition = condW > 0;
 
-    // Assemble the brace from Unicode bracket pieces, one per row:
-    //   rowCount 1: single ⎰-ish glyph (rare; fall back to "{")
-    //   rowCount 2: ⎰ ⎱ (upper + lower halves, no middle)
-    //   rowCount 3+: ⎧ (top), ⎪ (extensions), ⎨ (middle), ⎪ ..., ⎩ (bottom)
-    //
-    // Pieces stack with line-height:1 so they join visually. Emitting
-    // one cell per row (matching value/cond cell counts) keeps the
-    // paste importer happy — it's the same structural pattern as the
-    // matrix's per-row bracket cells, which Docs handles cleanly.
-    const bracePiece = (r, n) => {
-      if (n === 1) return "{";
-      if (n === 2) return r === 0 ? "⎰" : "⎱";
-      if (r === 0) return "⎧";
-      if (r === n - 1) return "⎩";
-      const middle = Math.floor((n - 1) / 2);
-      if (r === middle) return "⎨";
-      return "⎪";
-    };
-
-    const bracePt = Math.round(mathPt * 1.4);
+    // Single oversized "{" in one <td rowspan=rowCount> cell on row 0.
+    // Earlier versions stacked Unicode brace pieces (⎰⎱ for 2 rows;
+    // ⎧⎪⎨⎪⎩ for taller) one per row — but in Arial those glyphs render
+    // centered in their cells with gaps between pieces, and when a
+    // sibling fraction pushes row heights past the glyph heights the
+    // gaps become huge (the ⎰/⎱ pair looked like a split ⌠/⌡ with
+    // empty space in the middle). The single-glyph rowspan approach is
+    // the same pattern buildCasesHTML uses and Docs paste handles
+    // cleanly. Brace font size scales with row count so it visually
+    // fills the cases block regardless of how tall it grows.
+    const bracePt = Math.max(mathPt * 1.8, mathPt * rowCount * 1.1);
     setRichFont(bracePt);
-    const braceW = cellWidthPx(richMeasure("⎨"), bracePt, 0.05);
+    const braceW = cellWidthPx(richMeasure("{"), bracePt, 0);
 
     const braceCellStyle =
       `padding:0 !important;border:none;line-height:1;white-space:nowrap;` +
@@ -1407,13 +1439,14 @@
         );
       } else if (part.kind === "matrix") {
         for (let r = 0; r < rowCount; r++) {
-          const piece = bracePiece(r, rowCount);
-          rowsCells[r].push(
-            `<td width="${braceW}" align="center" ` +
-            `style="${braceCellStyle}">` +
-            `<span style="font-size:${bracePt}pt;line-height:1;">${piece}</span>` +
-            `</td>`
-          );
+          if (r === 0) {
+            rowsCells[r].push(
+              `<td rowspan="${rowCount}" width="${braceW}" ` +
+              `align="center" valign="middle" style="${braceCellStyle}">` +
+              `<span style="font-size:${bracePt}pt;line-height:1;">{</span>` +
+              `</td>`
+            );
+          }
           const vHTML = cellHTML(r, 0);
           rowsCells[r].push(
             `<td width="${valueW}" style="${valueCellStyle}">` +
@@ -1451,7 +1484,7 @@
           ? inner.html
           : richPara(mathPt, inner.html);
         const style = inner.structural
-          ? `padding:0 !important;border:none;line-height:1;` +
+          ? `padding:0 !important;border:none;font-size:0;line-height:0;` +
             `text-align:center;vertical-align:middle;${dbg("#a0f")}`
           : `padding:0 !important;border:none;white-space:nowrap;` +
             `line-height:1.15;text-align:center;vertical-align:middle;` +
@@ -1464,11 +1497,12 @@
       }
     }
 
-    const trHTML = rowsCells.map((tds) => `<tr>${tds.join("")}</tr>`).join("");
+    const trHTML = rowsCells.map((tds) => `<tr height="1">${tds.join("")}</tr>`).join("");
     LOG("cases-seq: built HTML", { rowCount, totalW, hasCondition });
     return (
       `<meta charset="utf-8">` +
-      `<table width="${totalW}" style="border-collapse:collapse;border:none;` +
+      `<table width="${totalW}" cellspacing="0" cellpadding="0" ` +
+      `style="border-collapse:collapse;border:none;margin:0;padding:0;` +
       `width:${totalW}px;">` +
       trHTML +
       `</table>`
@@ -1495,58 +1529,67 @@
       const m = /<table\s+width="(\d+)"/.exec(html);
       return m ? parseInt(m[1], 10) : 0;
     };
+    const countTR = (html) => (html.match(/<tr\b/gi) || []).length;
 
-    const cells = [];
-    let totalW = 0;
-
+    // Pass 1: build each inner HTML and record its rendered row count.
+    // Every inner table uses line-height:1 + font-size:pt on its rows,
+    // so rows * pt approximates the actual rendered pt-height closely —
+    // no guess-and-fudge like the old partHeightPt estimator, which
+    // assumed worst-case 2 outer rows per cases row and so inflated the
+    // height for simple text-only cases blocks.
+    const built = [];
     for (const part of parts) {
       if (part.kind === "text") {
         const valueHTML = part.valueHTML || part.value;
         if (!valueHTML) continue;
         setRichFont(textPt);
-        const contentPx = richMeasure(stripHTMLTags(valueHTML));
-        const w = cellWidthPx(contentPx, textPt, MATRIX_TEXT_SIBLING_PAD_EM);
-        totalW += w;
-        const style =
-          `padding:0 !important;border:none;white-space:nowrap;` +
-          `line-height:1.15;text-align:center;vertical-align:middle;` +
-          `font-family:${CELL_FONT_FAMILY};font-size:${textPt}pt;` +
-          `font-weight:normal;${dbg("#0cc")}`;
-        cells.push(
-          `<td valign="middle" align="center" width="${w}" height="1" ` +
-          `style="${style}">${valueHTML}</td>`
+        const plainText = stripHTMLTags(valueHTML);
+        const contentPx = richMeasure(plainText);
+        // MATRIX_TEXT_SIBLING_PAD_EM alone is the visual breathing pad
+        // between a text cell and its neighboring structural block —
+        // tuned for short separators like `+`/`=`. Long text like
+        // `1+3[T]_{ij}=` compounds the Arial-canvas vs Docs-render
+        // font drift to more than that tiny pad can absorb, so Docs
+        // wraps. Only long runs need the extra CELL_SAFETY_EM budget —
+        // adding it to short separators inflates margins around the
+        // `+` between structural blocks.
+        const isLongText = plainText.length > 3;
+        const w = cellWidthPx(
+          contentPx,
+          textPt,
+          MATRIX_TEXT_SIBLING_PAD_EM + (isLongText ? CELL_SAFETY_EM : 0)
         );
+        const inner =
+          `<span style="font-size:${textPt}pt;line-height:1;">` +
+          `${valueHTML}</span>`;
+        built.push({
+          kind: "text",
+          inner, w, hPt: textPt,
+        });
       } else if (part.kind === "sqrt") {
-        const c = part.contentHTML || part.content || "";
-        const v = "√(" + c + ")";
-        setRichFont(mathPt);
-        const contentPx = richMeasure(stripHTMLTags(v));
-        const w = cellWidthPx(contentPx, mathPt, MATRIX_TEXT_SIBLING_PAD_EM);
-        totalW += w;
-        const style =
-          `padding:0 !important;border:none;white-space:nowrap;` +
-          `line-height:1.15;text-align:center;vertical-align:middle;` +
-          `font-family:${CELL_FONT_FAMILY};font-size:${mathPt}pt;` +
-          `font-weight:normal;${dbg("#0cc")}`;
-        cells.push(
-          `<td valign="middle" align="center" width="${w}" height="1" ` +
-          `style="${style}">${v}</td>`
+        const inner = buildSqrtInnerHTML(
+          part.contentHTML || part.content || "",
+          mathPt
         );
+        const w = parseW(inner);
+        // sqrt table is 2 rows (1pt spacer + ~1.4×mathPt glyph line).
+        // Effective pt-height ≈ 1 + 1.4×mathPt ≈ 2×mathPt.
+        built.push({
+          kind: "sqrt",
+          inner, w, hPt: mathPt * 2,
+        });
       } else if (part.kind === "fraction") {
         const inner = buildFractionInnerHTML(
           part.numHTML || part.num,
           part.denHTML || part.den,
-          mathPt
+          mathPt,
+          part.variant
         );
         const w = parseW(inner);
-        totalW += w;
-        const style =
-          `padding:0 !important;border:none;line-height:1;` +
-          `text-align:center;vertical-align:middle;${dbg("#a0f")}`;
-        cells.push(
-          `<td valign="middle" align="center" width="${w}" ` +
-          `style="${style}">${inner}</td>`
-        );
+        built.push({
+          kind: "fraction",
+          inner, w, hPt: mathPt * 2,
+        });
       } else if (part.kind === "choose") {
         const full = buildChooseHTML(
           part.numHTML || part.num,
@@ -1555,14 +1598,10 @@
         );
         const inner = stripMeta(full);
         const w = parseW(full);
-        totalW += w;
-        const style =
-          `padding:0 !important;border:none;line-height:1;` +
-          `text-align:center;vertical-align:middle;${dbg("#a0f")}`;
-        cells.push(
-          `<td valign="middle" align="center" width="${w}" ` +
-          `style="${style}">${inner}</td>`
-        );
+        built.push({
+          kind: "choose",
+          inner, w, hPt: mathPt * 2,
+        });
       } else if (part.kind === "matrix") {
         const full = part.style === "cases"
           ? buildCasesHTML(part.rows, sourcePt, part.rowsHTML, part.rowsParts)
@@ -1574,34 +1613,80 @@
               part.rowsParts
             );
         const inner = stripMeta(full);
-        // True matrices (not cases) get nudged right inside their
-        // purple wrapper cell via padding-left. An earlier attempt
-        // nested a table `[spacer | matrix]` inside the wrapper, but
-        // the nested table's border-collapse context clipped the
-        // matrix's left bracket stroke to a thinner line. Using
-        // padding on the wrapper <td> keeps the matrix table alone
-        // inside, so its bracket borders render at full thickness.
-        // Cases keep their natural centering (brace-on-left already
-        // provides the visual offset a bracketed matrix lacks).
-        const isMatrix = part.style !== "cases";
-        const MATRIX_LEFT_SHIFT = isMatrix ? 2 : 0;
-        const MATRIX_RIGHT_SHIFT = isMatrix ? 2 : 0;
         const baseW = parseW(full);
-        // Content-box: declared width is content area, padding adds on
-        // top visually. totalW is visual (what the outer table sums).
-        // Cases cell is 1px narrower than matrices' centering slack so
-        // the right margin sits closer to the next part.
-        const w = baseW + (isMatrix ? 3 : 2);
-        totalW += w + MATRIX_LEFT_SHIFT + MATRIX_RIGHT_SHIFT;
-        const padStyle = (MATRIX_LEFT_SHIFT || MATRIX_RIGHT_SHIFT)
-          ? `padding:0 ${MATRIX_RIGHT_SHIFT}px 0 ${MATRIX_LEFT_SHIFT}px !important;`
-          : `padding:0 !important;`;
+        const isMatrix = part.style !== "cases";
+        // Count actual <tr> in the built HTML — this is the exact
+        // number of rendered rows (cases with mixed fraction/text
+        // rows produces a variable count). Multiply by mathPt for
+        // accurate total pt-height.
+        const rows = countTR(inner);
+        built.push({
+          kind: "matrix",
+          isMatrix,
+          inner,
+          w: baseW + (isMatrix ? 3 : 0),
+          hPt: rows * mathPt,
+        });
+      }
+    }
+
+    if (!built.length) return null;
+
+    // Accurate outer row height: max of each part's true content pt-height.
+    const maxHpt = built.reduce((m, b) => Math.max(m, b.hPt), 0);
+    const outerH = Math.ceil(maxHpt * PT_TO_PX);
+
+    const cells = [];
+    let totalW = 0;
+    for (const b of built) {
+      const ihpx = Math.ceil(b.hPt * PT_TO_PX);
+      const tp = Math.max(0, Math.floor((outerH - ihpx) / 2));
+      const bp = Math.max(0, outerH - ihpx - tp);
+      const vPad = `padding:${tp}px 0 ${bp}px 0 !important;`;
+
+      if (b.kind === "text") {
+        totalW += b.w;
         const style =
-          `${padStyle}border:none;line-height:1;` +
+          `${vPad}border:none;white-space:nowrap;` +
+          `font-size:0;line-height:0;text-align:center;vertical-align:middle;` +
+          `font-family:${CELL_FONT_FAMILY};` +
+          `font-weight:normal;${dbg("#0cc")}`;
+        cells.push(
+          `<td valign="middle" align="center" width="${b.w}" ` +
+          `style="${style}">${b.inner}</td>`
+        );
+      } else if (b.kind === "sqrt") {
+        totalW += b.w;
+        const style =
+          `${vPad}border:none;font-size:0;line-height:0;` +
+          `text-align:center;vertical-align:middle;${dbg("#0af")}`;
+        cells.push(
+          `<td valign="middle" align="center" width="${b.w}" ` +
+          `style="${style}">${b.inner}</td>`
+        );
+      } else if (b.kind === "fraction" || b.kind === "choose") {
+        totalW += b.w;
+        const style =
+          `${vPad}border:none;font-size:0;line-height:0;` +
           `text-align:center;vertical-align:middle;${dbg("#a0f")}`;
         cells.push(
-          `<td valign="middle" align="center" width="${w}" ` +
-          `style="${style}">${inner}</td>`
+          `<td valign="middle" align="center" width="${b.w}" ` +
+          `style="${style}">${b.inner}</td>`
+        );
+      } else if (b.kind === "matrix") {
+        const MATRIX_LEFT_SHIFT = b.isMatrix ? 2 : 0;
+        const MATRIX_RIGHT_SHIFT = b.isMatrix ? 1 : 0;
+        totalW += b.w + MATRIX_LEFT_SHIFT + MATRIX_RIGHT_SHIFT;
+        // Horizontal shift merges into the same padding declaration.
+        const padStyle =
+          `padding:${tp}px ${MATRIX_RIGHT_SHIFT}px ${bp}px ` +
+          `${MATRIX_LEFT_SHIFT}px !important;`;
+        const style =
+          `${padStyle}border:none;font-size:0;line-height:0;` +
+          `text-align:center;vertical-align:middle;${dbg("#a0f")}`;
+        cells.push(
+          `<td valign="middle" align="center" width="${b.w}" ` +
+          `style="${style}">${b.inner}</td>`
         );
       }
     }
@@ -1613,11 +1698,17 @@
     // last cell, but the extra appeared to get redistributed into
     // cells, inflating the apparent spacing around each structural
     // block. Same-total rule keeps every cell at its natural width.
+    // Ceil because fractional shifts (e.g. 3.5px) on matrix cells can
+    // leave totalW non-integer; HTML width="" wants an integer.
+    const outerW = Math.ceil(totalW);
     return (
       `<meta charset="utf-8">` +
-      `<table width="${totalW}" style="border-collapse:collapse;border:none;` +
-      `width:${totalW}px;">` +
-      `<tr>${cells.join("")}</tr>` +
+      `<table width="${outerW}" cellspacing="0" cellpadding="0" ` +
+      `style="border-collapse:collapse;border:none;margin:0;padding:0;` +
+      `font-size:0;line-height:0;width:${outerW}px;">` +
+      `<tr>` +
+      cells.join("") +
+      `</tr>` +
       `</table>`
     );
   }
@@ -1645,7 +1736,8 @@
       html = buildFractionHTML(
         rich.numHTML || rich.num,
         rich.denHTML || rich.den,
-        sourcePt
+        sourcePt,
+        rich.variant
       );
     } else if (rich.kind === "choose") {
       html = buildChooseHTML(
@@ -1653,6 +1745,8 @@
         rich.denHTML || rich.den,
         sourcePt
       );
+    } else if (rich.kind === "sqrt") {
+      html = buildSqrtHTML(rich.contentHTML || rich.content || "", sourcePt);
     } else if (rich.kind === "matrix") {
       if (rich.style === "cases") {
         html = buildCasesHTML(rich.rows, sourcePt, rich.rowsHTML, rich.rowsParts);
