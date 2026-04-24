@@ -28,20 +28,12 @@
     hookrightarrow: "↪", hookleftarrow: "↩",
     nearrow: "↗", searrow: "↘", swarrow: "↙", nwarrow: "↖",
     rightharpoonup: "⇀", leftharpoonup: "↼",
-    rightharpoondown: "⇁", leftharpoondown: "↽",
-    rightleftharpoons: "⇌", leftrightharpoons: "⇋",
-    twoheadrightarrow: "↠", leadsto: "⤳",
     implies: "⟹", impliedby: "⟸", iff: "⟺",
 
     pm: "±", mp: "∓", times: "×", div: "÷",
     cdot: "·", ast: "∗", star: "⋆", circ: "∘",
     bullet: "•", oplus: "⊕", ominus: "⊖", otimes: "⊗",
     oslash: "⊘", odot: "⊙", dagger: "†", ddagger: "‡",
-    uplus: "⊎", amalg: "⨿", wr: "≀",
-    ltimes: "⋉", rtimes: "⋊",
-    triangleleft: "◁", triangleright: "▷",
-    bigtriangleup: "△", bigtriangledown: "▽",
-    sqcup: "⊔", sqcap: "⊓", bigsqcup: "⨆",
 
     le: "≤", leq: "≤", ge: "≥", geq: "≥",
     neq: "≠", ne: "≠", approx: "≈", equiv: "≡",
@@ -49,13 +41,6 @@
     ll: "≪", gg: "≫", prec: "≺", succ: "≻",
     preceq: "⪯", succeq: "⪰", propto: "∝",
     models: "⊨", vdash: "⊢", dashv: "⊣",
-    nless: "≮", ngtr: "≯", nleq: "≰", ngeq: "≱",
-    lesssim: "≲", gtrsim: "≳",
-    lessapprox: "⪅", gtrapprox: "⪆",
-    sqsubset: "⊏", sqsupset: "⊐",
-    sqsubseteq: "⊑", sqsupseteq: "⊒",
-    triangleq: "≜", asymp: "≍", bowtie: "⋈",
-    smile: "⌣", frown: "⌢",
 
     subset: "⊂", supset: "⊃", subseteq: "⊆", supseteq: "⊇",
     subsetneq: "⊊", supsetneq: "⊋",
@@ -184,24 +169,19 @@
     return { text: out, allMapped };
   }
 
-  const FRAC_VARIANTS = ["frac", "dfrac", "tfrac", "cfrac"];
-
   function expandFrac(s) {
-    for (const name of FRAC_VARIANTS) {
-      const marker = "\\" + name + "{";
-      let idx;
-      while ((idx = s.indexOf(marker)) >= 0) {
-        const aStart = idx + marker.length;
-        const aEnd = findMatchingBrace(s, aStart - 1);
-        if (aEnd < 0) break;
-        if (s[aEnd + 1] !== "{") break;
-        const bStart = aEnd + 2;
-        const bEnd = findMatchingBrace(s, bStart - 1);
-        if (bEnd < 0) break;
-        const num = s.substring(aStart, aEnd);
-        const den = s.substring(bStart, bEnd);
-        s = s.substring(0, idx) + "(" + num + ")/(" + den + ")" + s.substring(bEnd + 1);
-      }
+    let idx;
+    while ((idx = s.indexOf("\\frac{")) >= 0) {
+      const aStart = idx + "\\frac{".length;
+      const aEnd = findMatchingBrace(s, aStart - 1);
+      if (aEnd < 0) break;
+      if (s[aEnd + 1] !== "{") break;
+      const bStart = aEnd + 2;
+      const bEnd = findMatchingBrace(s, bStart - 1);
+      if (bEnd < 0) break;
+      const num = s.substring(aStart, aEnd);
+      const den = s.substring(bStart, bEnd);
+      s = s.substring(0, idx) + "(" + num + ")/(" + den + ")" + s.substring(bEnd + 1);
     }
     return s;
   }
@@ -405,50 +385,6 @@
     return s;
   }
 
-  // \sfrac{a}{b} — inline slashed fraction from the xfrac package.
-  // Unlike \frac/\dfrac/\tfrac/\cfrac (stacked), sfrac renders as
-  // `<sup>a</sup>⁄<sub>b</sub>` (HTML) or `ᵃ⁄ᵦ` unicode (plain), so it
-  // stays inline with surrounding text and never becomes a structural
-  // part. Expanded up-front in latexToUnicode so it flows through like
-  // any other text.
-  function expandSfrac(s, options) {
-    const html = options && options.html;
-    const marker = "\\sfrac{";
-    let idx;
-    while ((idx = s.indexOf(marker)) >= 0) {
-      const aStart = idx + marker.length;
-      const aEnd = findMatchingBrace(s, aStart - 1);
-      if (aEnd < 0) break;
-      if (s[aEnd + 1] !== "{") break;
-      const bStart = aEnd + 2;
-      const bEnd = findMatchingBrace(s, bStart - 1);
-      if (bEnd < 0) break;
-      const numSrc = s.substring(aStart, aEnd);
-      const denSrc = s.substring(bStart, bEnd);
-      let replacement;
-      if (html) {
-        // Recursively compile the inner bits so \alpha, nested \frac,
-        // etc., resolve; then wrap in sup/sub so Docs' paste importer
-        // applies native superscript/subscript formatting.
-        const numH = latexToUnicode(numSrc, options);
-        const denH = latexToUnicode(denSrc, options);
-        replacement = "<sup>" + numH + "</sup>⁄<sub>" + denH + "</sub>";
-      } else {
-        const numU = latexToUnicode(numSrc);
-        const denU = latexToUnicode(denSrc);
-        const num = mapChars(numU, SUPERSCRIPTS);
-        const den = mapChars(denU, SUBSCRIPTS);
-        if (num.allMapped && den.allMapped) {
-          replacement = num.text + "⁄" + den.text;
-        } else {
-          replacement = numU + "/" + denU;
-        }
-      }
-      s = s.substring(0, idx) + replacement + s.substring(bEnd + 1);
-    }
-    return s;
-  }
-
   function latexToUnicode(input, options) {
     if (typeof input !== "string") return "";
     let s = input;
@@ -465,7 +401,6 @@
       s = s.replace(new RegExp("\\\\" + w + "(?![a-zA-Z])", "g"), "");
     }
 
-    s = expandSfrac(s, options);
     s = expandStructures(s);
 
     const commands = [
@@ -553,16 +488,8 @@
     };
 
     while (i < s.length) {
-      let fracMatch = null;
-      for (const name of FRAC_VARIANTS) {
-        if (s.startsWith("\\" + name + "{", i)) {
-          fracMatch = name;
-          break;
-        }
-      }
-      if (fracMatch) {
-        const marker = "\\" + fracMatch + "{";
-        const aStart = i + marker.length;
+      if (s.startsWith("\\frac{", i)) {
+        const aStart = i + "\\frac{".length;
         const aEnd = findMatchingBrace(s, aStart - 1);
         if (aEnd >= 0 && s[aEnd + 1] === "{") {
           const bStart = aEnd + 2;
@@ -573,7 +500,6 @@
             const denSrc = s.substring(bStart, bEnd);
             parts.push({
               kind: "fraction",
-              variant: fracMatch,
               num: latexToUnicode(numSrc),
               den: latexToUnicode(denSrc),
               numHTML: latexToUnicode(numSrc, { html: true }),
