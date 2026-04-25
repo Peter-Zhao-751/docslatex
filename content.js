@@ -353,6 +353,21 @@
     if (!parts || !parts.length) {
       return { html: "", width: 0, structural: false };
     }
+    // Single-sqrt fast path: emit the radical's own table directly so
+    // `\sqrt{x}` as a matrix cell or as a sibling of a matrix renders
+    // with a vinculum instead of degrading to the text form `√(x)`. The
+    // 2-row outer wrapper below is shaped for fraction/choose layouts
+    // and would just nest the sqrt table redundantly.
+    if (parts.length === 1 && parts[0].kind === "sqrt") {
+      const part = parts[0];
+      const sqrtInner = buildSqrtInnerHTML(
+        part.contentHTML || part.content || "",
+        pt
+      );
+      const m = /<table\s+width="(\d+)"/.exec(sqrtInner);
+      const w = m ? parseInt(m[1], 10) : 0;
+      return { html: sqrtInner, width: w, structural: true };
+    }
     const hasStructure = parts.some(
       (p) => p.kind === "fraction" || p.kind === "choose"
     );
@@ -401,23 +416,24 @@
           `height="1" style="${style}">${valueHTML}</td>`
         );
       } else if (part.kind === "sqrt") {
-        const contentHTML = part.contentHTML || part.content || "";
-        const v = "√(" + contentHTML + ")";
-        setRichFont(pt);
-        const w = cellWidthPx(
-          richMeasure(stripHTMLTags(v)),
-          pt,
-          TEXT_SIDE_PAD_EM
+        // Embed the radical's own mini-table inside a rowspan=2 cell so
+        // it sits inline with sibling fraction/choose blocks while still
+        // showing the vinculum (the text fallback `√(x)` was clobbering
+        // it). valign:middle centers the fixed-height sqrt inside the
+        // taller 2-row outer cell.
+        const sqrtInner = buildSqrtInnerHTML(
+          part.contentHTML || part.content || "",
+          pt
         );
+        const m = /<table\s+width="(\d+)"/.exec(sqrtInner);
+        const w = m ? parseInt(m[1], 10) : 0;
         totalW += w;
         const style =
-          `padding:0 !important;border:none;white-space:nowrap;` +
-          `line-height:1.15;text-align:center;vertical-align:middle;` +
-          `font-family:${CELL_FONT_FAMILY};font-size:${pt}pt;` +
-          `font-weight:normal;${dbg("#0cc")}`;
+          `padding:0 !important;border:none;line-height:1;` +
+          `text-align:center;vertical-align:middle;${dbg("#a0f")}`;
         topCells.push(
           `<td rowspan="2" valign="middle" align="center" width="${w}" ` +
-          `height="1" style="${style}">${v}</td>`
+          `height="1" style="${style}">${sqrtInner}</td>`
         );
       } else if (part.kind === "fraction") {
         const numHTML = part.numHTML || part.num;
@@ -2230,10 +2246,25 @@
         const lineH = line.yBot - line.yTop;
         const overlap =
           Math.min(fBot, line.yBot) - Math.max(fTop, line.yTop);
-        // 25% vertical overlap is enough: a raised superscript still
-        // dips into the baseline's bounding box, and we want it on the
-        // same line rather than on a ghost line above.
-        if (overlap > Math.min(f.height, lineH) * 0.25) {
+        // Adaptive threshold:
+        //   - Different heights (sup/sub vs base text): 25% — a raised
+        //     superscript only dips into the baseline's bounding box
+        //     by ~25%, so we keep that loose so sup/sub clusters with
+        //     its base.
+        //   - Same height (regular text vs regular text): 50% — needed
+        //     for matrix-with-wrapper-prefix layouts. The prefix cell
+        //     in `[T]=\begin{bmatrix}...` is rowspan-vertically-
+        //     centered against the matrix's full height, so its
+        //     y-range overlaps row 2 AND row 3 of the matrix (each by
+        //     ~30-36%). The 25% threshold then transitively merges
+        //     row 2 + prefix + row 3 into one line, scrambling matrix
+        //     detection. With 50% for same-height content, the
+        //     prefix's partial overlap doesn't bridge across rows.
+        const sizeRatio = Math.min(f.height, lineH) /
+          Math.max(f.height, lineH);
+        const minH = Math.min(f.height, lineH);
+        const threshold = sizeRatio > 0.85 ? 0.5 : 0.25;
+        if (overlap > minH * threshold) {
           line.fragments.push(f);
           line.yTop = Math.min(line.yTop, fTop);
           line.yBot = Math.max(line.yBot, fBot);
@@ -2275,6 +2306,1015 @@
     // the baseline can't pull its line above the previous one.
     lines.sort((a, b) => a.yBot - b.yBot);
 
+    const yOverlap = (a, b) => {
+      const aTop = a.y;
+      const aBot = a.y + a.height;
+      const bTop = b.y;
+      const bBot = b.y + b.height;
+      return Math.max(0, Math.min(aBot, bBot) - Math.max(aTop, bTop));
+    };
+
+    const medianFragmentHeight = (frags, excludeTexts) => {
+      const hs = frags
+        .filter((f) => !f.pseudo && !excludeTexts.has(f.text))
+        .map((f) => f.height)
+        .filter((h) => h > 0)
+        .sort((a, b) => a - b);
+      return hs.length ? hs[Math.floor(hs.length / 2)] : 0;
+    };
+
+    // Recompute native sup/sub annotations in small horizontal islands
+    // instead of against an entire structural row. In mixed rows like
+    // `\binom{j-1}{i-1}(-a)^{j-i}`, the binom numerator/denominator sit
+    // at different baselines from the following `(-a)` text; using the
+    // whole row can turn a real superscript into a subscript.
+    const redoScriptsLocal = (frags) => {
+      const targets = frags.filter(
+        (f) => !f.pseudo && f.script !== "binom" && f.script !== "sqrt"
+      );
+      if (!targets.length) return;
+      for (const f of targets) f.script = "normal";
+
+      const sorted = [...targets].sort((a, b) => a.x - b.x);
+      const clusters = [];
+      for (const f of sorted) {
+        const last = clusters[clusters.length - 1];
+        const gap = last ? f.x - last.maxX : Infinity;
+        const joinGap = Math.max(7, fontPx(f.font) * 0.45);
+        if (!last || gap > joinGap) {
+          clusters.push({
+            frags: [f],
+            maxX: f.x + f.width,
+          });
+        } else {
+          last.frags.push(f);
+          last.maxX = Math.max(last.maxX, f.x + f.width);
+        }
+      }
+
+      for (const cluster of clusters) {
+        const sizeCounts = new Map();
+        for (const f of cluster.frags) {
+          const s = fontPx(f.font);
+          if (!s) continue;
+          sizeCounts.set(s, (sizeCounts.get(s) || 0) + 1);
+        }
+        let baseSize = 0;
+        let baseCount = 0;
+        for (const [s, c] of sizeCounts) {
+          if (c > baseCount || (c === baseCount && s > baseSize)) {
+            baseCount = c;
+            baseSize = s;
+          }
+        }
+        if (!baseSize) continue;
+        let baseFrag = null;
+        for (const f of cluster.frags) {
+          if (fontPx(f.font) === baseSize) { baseFrag = f; break; }
+        }
+        if (!baseFrag) continue;
+        const baseMid = baseFrag.y + baseFrag.height / 2;
+        const tol = baseFrag.height * 0.1;
+        for (const f of cluster.frags) {
+          const s = fontPx(f.font);
+          if (s === 0 || s >= baseSize * 0.85) continue;
+          const fMid = f.y + f.height / 2;
+          if (fMid < baseMid - tol) f.script = "sup";
+          else if (fMid > baseMid + tol) f.script = "sub";
+        }
+      }
+    };
+
+    // Fold a compiler-rendered binomial wherever its two tall parens
+    // and stacked contents appear in the same fragment collection. This
+    // deliberately uses geometry rather than array adjacency because a
+    // cases row can split the numerator and denominator across two
+    // logical lines before the cases detector has rebuilt the row.
+    const foldBinomsInFragments = (frags) => {
+      const medianH = medianFragmentHeight(frags, new Set(["(", ")", "{"]));
+      if (!medianH) return;
+      const isTallParen = (f, ch) =>
+        !f.pseudo && f.text === ch && f.height > medianH * 1.35;
+
+      let idx = 0;
+      while (idx < frags.length) {
+        const open = frags[idx];
+        if (!isTallParen(open, "(")) { idx++; continue; }
+
+        let close = null;
+        for (const g of frags) {
+          if (!isTallParen(g, ")")) continue;
+          if (g.x <= open.x) continue;
+          const overlap = yOverlap(open, g);
+          const minH = Math.min(open.height, g.height);
+          if (minH > 0 && overlap < minH * 0.6) continue;
+          if (!close || g.x < close.x) close = g;
+        }
+        if (!close) { idx++; continue; }
+
+        const left = open.x + open.width / 2;
+        const right = close.x + close.width / 2;
+        const top = Math.min(open.y, close.y);
+        const bot = Math.max(open.y + open.height, close.y + close.height);
+        const middle = frags.filter((g) => {
+          if (g.pseudo || g === open || g === close) return false;
+          const cx = g.x + g.width / 2;
+          const cy = g.y + g.height / 2;
+          return cx > left && cx < right && cy >= top && cy <= bot;
+        });
+        if (middle.length < 2) { idx++; continue; }
+
+        const byY = [...middle].sort(
+          (a, b) => (a.y + a.height / 2) - (b.y + b.height / 2)
+        );
+        let splitAt = -1;
+        let maxGap = 0;
+        for (let k = 1; k < byY.length; k++) {
+          const prev = byY[k - 1].y + byY[k - 1].height / 2;
+          const curr = byY[k].y + byY[k].height / 2;
+          const gap = curr - prev;
+          if (gap > maxGap) {
+            maxGap = gap;
+            splitAt = k;
+          }
+        }
+        if (splitAt <= 0 || maxGap < Math.max(2, medianH * 0.15)) {
+          idx++;
+          continue;
+        }
+        const topBand = byY.slice(0, splitAt);
+        const botBand = byY.slice(splitAt);
+        if (!topBand.length || !botBand.length) { idx++; continue; }
+
+        topBand.sort((a, b) => a.x - b.x);
+        botBand.sort((a, b) => a.x - b.x);
+        for (const g of topBand) g.script = "binom";
+        for (const g of botBand) g.script = "binom";
+        open.text = "\\binom{";
+        open.script = "binom";
+        close.text = "}";
+        close.script = "binom";
+
+        const splitter = {
+          text: "}{",
+          x: (topBand[topBand.length - 1].x +
+              topBand[topBand.length - 1].width +
+              botBand[0].x) / 2,
+          y: (top + bot) / 2,
+          width: 0,
+          height: 0,
+          font: "",
+          pseudo: true,
+          script: "binom",
+        };
+
+        const content = new Set([...topBand, ...botBand]);
+        const rebuilt = [];
+        for (const f of frags) {
+          if (!content.has(f)) rebuilt.push(f);
+        }
+        const openIdx = rebuilt.indexOf(open);
+        if (openIdx < 0 || rebuilt.indexOf(close) < 0) { idx++; continue; }
+        rebuilt.splice(openIdx + 1, 0, ...topBand, splitter, ...botBand);
+        frags.splice(0, frags.length, ...rebuilt);
+        idx = openIdx + topBand.length + botBand.length + 3;
+      }
+    };
+
+    const foldSplitBinomsInRows = (rows) => {
+      let changed = false;
+      for (let r = 0; r < rows.length - 1; r++) {
+        const row = rows[r];
+        const next = rows[r + 1];
+        const medianH = medianFragmentHeight(
+          [...row, ...next],
+          new Set(["(", ")", "{"])
+        );
+        if (!medianH) continue;
+        const isTallParen = (f, ch) =>
+          !f.pseudo && f.text === ch && f.height > medianH * 1.35;
+
+        let idx = 0;
+        while (idx < row.length) {
+          const open = row[idx];
+          if (!isTallParen(open, "(")) { idx++; continue; }
+          let close = null;
+          for (const f of row) {
+            if (!isTallParen(f, ")")) continue;
+            if (f.x <= open.x) continue;
+            const overlap = yOverlap(open, f);
+            const minH = Math.min(open.height, f.height);
+            if (minH > 0 && overlap < minH * 0.6) continue;
+            if (!close || f.x < close.x) close = f;
+          }
+          if (!close) { idx++; continue; }
+
+          const left = open.x + open.width / 2;
+          const right = close.x + close.width / 2;
+          const parenTop = Math.min(open.y, close.y);
+          const parenBot = Math.max(open.y + open.height, close.y + close.height);
+          const inParens = (f) => {
+            if (f.pseudo || f === open || f === close) return false;
+            const cx = f.x + f.width / 2;
+            return cx > left && cx < right;
+          };
+          const topBand = row.filter(inParens);
+          const botBand = next.filter(inParens);
+          if (!topBand.length || !botBand.length) { idx++; continue; }
+
+          topBand.sort((a, b) => a.x - b.x);
+          botBand.sort((a, b) => a.x - b.x);
+          for (const f of topBand) f.script = "binom";
+          for (const f of botBand) f.script = "binom";
+          open.text = "\\binom{";
+          open.script = "binom";
+          close.text = "}";
+          close.script = "binom";
+
+          const splitter = {
+            text: "}{",
+            x: (topBand[topBand.length - 1].x +
+                topBand[topBand.length - 1].width +
+                botBand[0].x) / 2,
+            y: (parenTop + parenBot) / 2,
+            width: 0,
+            height: 0,
+            font: "",
+            pseudo: true,
+            script: "binom",
+          };
+
+          const content = new Set([...topBand, ...botBand]);
+          const rebuilt = [];
+          for (const f of row) {
+            if (content.has(f)) continue;
+            rebuilt.push(f);
+            if (f === open) {
+              rebuilt.push(...topBand, splitter, ...botBand);
+            }
+          }
+          rows[r] = rebuilt;
+          rows[r + 1] = next.filter((f) => !content.has(f));
+          changed = true;
+          idx = rebuilt.indexOf(close) + 1;
+        }
+      }
+
+      for (let r = rows.length - 1; r >= 0; r--) {
+        if (rows[r].some((f) => !f.pseudo)) continue;
+        rows.splice(r, 1);
+        changed = true;
+      }
+      return changed;
+    };
+
+    const foldStackedBinomsInFragments = (frags) => {
+      if (frags.some((f) => f.text === "\\binom{")) return false;
+      const medianH = medianFragmentHeight(frags, new Set(["(", ")", "{"]));
+      if (!medianH) return false;
+
+      const candidates = frags.filter((f) => {
+        if (f.pseudo || f.script === "binom") return false;
+        if (!/\S/.test(f.text || "")) return false;
+        if (/^[+&=<>()[\]{}|,.;:]$/.test(f.text || "")) return false;
+        return f.height >= medianH * 0.55;
+      });
+      if (candidates.length < 2) return false;
+
+      const centerY = (f) => f.y + f.height / 2;
+      const yBands = [];
+      const yTol = Math.max(2, medianH * 0.3);
+      for (const f of [...candidates].sort((a, b) => centerY(a) - centerY(b))) {
+        const cy = centerY(f);
+        const last = yBands[yBands.length - 1];
+        if (!last || Math.abs(cy - last.cy) > yTol) {
+          yBands.push({ frags: [f], cy, minY: f.y, maxY: f.y + f.height });
+        } else {
+          last.frags.push(f);
+          last.cy =
+            last.frags.reduce((sum, g) => sum + centerY(g), 0) /
+            last.frags.length;
+          last.minY = Math.min(last.minY, f.y);
+          last.maxY = Math.max(last.maxY, f.y + f.height);
+        }
+      }
+      if (yBands.length < 2) return false;
+
+      const xClusters = (band) => {
+        const clusters = [];
+        for (const f of [...band.frags].sort((a, b) => a.x - b.x)) {
+          const last = clusters[clusters.length - 1];
+          const gap = last ? f.x - last.maxX : Infinity;
+          if (!last || gap > Math.max(5, medianH * 0.45)) {
+            clusters.push({
+              frags: [f],
+              minX: f.x,
+              maxX: f.x + f.width,
+              minY: f.y,
+              maxY: f.y + f.height,
+            });
+          } else {
+            last.frags.push(f);
+            last.maxX = Math.max(last.maxX, f.x + f.width);
+            last.minY = Math.min(last.minY, f.y);
+            last.maxY = Math.max(last.maxY, f.y + f.height);
+          }
+        }
+        for (const c of clusters) {
+          c.cx = (c.minX + c.maxX) / 2;
+          c.cy = (c.minY + c.maxY) / 2;
+          c.w = Math.max(1, c.maxX - c.minX);
+          c.h = Math.max(1, c.maxY - c.minY);
+        }
+        return clusters;
+      };
+
+      const bandClusters = yBands.map((band) => xClusters(band));
+      let best = null;
+      for (let ti = 0; ti < bandClusters.length - 1; ti++) {
+        for (let bi = ti + 1; bi < bandClusters.length; bi++) {
+          const yGap = yBands[bi].cy - yBands[ti].cy;
+          if (yGap < Math.max(3, medianH * 0.35)) continue;
+          for (const top of bandClusters[ti]) {
+            for (const bot of bandClusters[bi]) {
+              const xOverlap = Math.max(
+                0,
+                Math.min(top.maxX, bot.maxX) - Math.max(top.minX, bot.minX)
+              );
+              const minW = Math.min(top.w, bot.w);
+              const maxW = Math.max(top.w, bot.w);
+              const centerDelta = Math.abs(top.cx - bot.cx);
+              if (xOverlap < minW * 0.25 && centerDelta > Math.max(4, maxW * 0.45)) {
+                continue;
+              }
+              if (minW / maxW < 0.35) continue;
+              const leftX = Math.min(top.minX, bot.minX);
+              const score =
+                xOverlap * 4 -
+                centerDelta * 1.5 -
+                Math.abs(top.w - bot.w) * 0.25 -
+                leftX * 0.02 +
+                yGap * 0.2;
+              if (!best || score > best.score) {
+                best = { top, bot, score };
+              }
+            }
+          }
+        }
+      }
+      if (!best) return false;
+
+      const topBand = [...best.top.frags].sort((a, b) => a.x - b.x);
+      const botBand = [...best.bot.frags].sort((a, b) => a.x - b.x);
+      for (const f of topBand) f.script = "binom";
+      for (const f of botBand) f.script = "binom";
+      const leftX = Math.min(best.top.minX, best.bot.minX);
+      const rightX = Math.max(best.top.maxX, best.bot.maxX);
+      const open = {
+        text: "\\binom{",
+        x: leftX - 1,
+        y: best.top.minY,
+        width: 0,
+        height: 0,
+        font: "",
+        pseudo: true,
+        script: "binom",
+      };
+      const splitter = {
+        text: "}{",
+        x: (topBand[topBand.length - 1].x +
+            topBand[topBand.length - 1].width +
+            botBand[0].x) / 2,
+        y: (best.top.cy + best.bot.cy) / 2,
+        width: 0,
+        height: 0,
+        font: "",
+        pseudo: true,
+        script: "binom",
+      };
+      const close = {
+        text: "}",
+        x: rightX + 1,
+        y: best.bot.maxY,
+        width: 0,
+        height: 0,
+        font: "",
+        pseudo: true,
+        script: "binom",
+      };
+
+      const content = new Set([...topBand, ...botBand]);
+      let insertIdx = Infinity;
+      for (let i = 0; i < frags.length; i++) {
+        if (content.has(frags[i])) insertIdx = Math.min(insertIdx, i);
+      }
+      if (!isFinite(insertIdx)) return false;
+      const rebuilt = [];
+      for (let i = 0; i < frags.length; i++) {
+        if (i === insertIdx) {
+          rebuilt.push(open, ...topBand, splitter, ...botBand, close);
+        }
+        if (!content.has(frags[i])) rebuilt.push(frags[i]);
+      }
+      frags.splice(0, frags.length, ...rebuilt);
+      return true;
+    };
+
+    const foldLeadingFlatBinomInFragments = (frags) => {
+      if (frags.some((f) => f.text === "\\binom{")) return false;
+      const medianH = medianFragmentHeight(frags, new Set(["(", ")", "{"]));
+      if (!medianH) return false;
+      const real = frags
+        .filter((f) => !f.pseudo && /\S/.test(f.text || ""))
+        .sort((a, b) => a.x - b.x);
+      if (real.length < 3) return false;
+
+      const clusters = [];
+      for (const f of real) {
+        const last = clusters[clusters.length - 1];
+        const gap = last ? f.x - last.maxX : Infinity;
+        if (!last || gap > Math.max(4, medianH * 0.35)) {
+          clusters.push({
+            frags: [f],
+            minX: f.x,
+            maxX: f.x + f.width,
+            minY: f.y,
+            maxY: f.y + f.height,
+          });
+        } else {
+          last.frags.push(f);
+          last.maxX = Math.max(last.maxX, f.x + f.width);
+          last.minY = Math.min(last.minY, f.y);
+          last.maxY = Math.max(last.maxY, f.y + f.height);
+        }
+      }
+      if (clusters.length < 3) return false;
+      for (const c of clusters) {
+        c.frags.sort((a, b) => a.x - b.x);
+        c.text = c.frags.map((f) => f.text || "").join("").replace(/\s+/g, "");
+        c.w = Math.max(1, c.maxX - c.minX);
+      }
+
+      const simpleIndexTerm = (text) =>
+        /^[A-Za-z0-9]+(?:[-+][A-Za-z0-9]+)+$/.test(text);
+      const suffix = (text) => {
+        const m = /([+-][A-Za-z0-9]+)$/.exec(text);
+        return m ? m[1] : "";
+      };
+      const top = clusters[0];
+      const bot = clusters[1];
+      if (!simpleIndexTerm(top.text) || !simpleIndexTerm(bot.text)) return false;
+      if (suffix(top.text) && suffix(bot.text) && suffix(top.text) !== suffix(bot.text)) {
+        return false;
+      }
+      if (Math.min(top.w, bot.w) / Math.max(top.w, bot.w) < 0.45) return false;
+
+      const topBand = top.frags;
+      const botBand = bot.frags;
+      for (const f of topBand) f.script = "binom";
+      for (const f of botBand) f.script = "binom";
+      const leftX = Math.min(top.minX, bot.minX);
+      const rightX = Math.max(top.maxX, bot.maxX);
+      const open = {
+        text: "\\binom{",
+        x: leftX - 1,
+        y: top.minY,
+        width: 0,
+        height: 0,
+        font: "",
+        pseudo: true,
+        script: "binom",
+      };
+      const splitter = {
+        text: "}{",
+        x: (topBand[topBand.length - 1].x +
+            topBand[topBand.length - 1].width +
+            botBand[0].x) / 2,
+        y: (top.maxY + bot.minY) / 2,
+        width: 0,
+        height: 0,
+        font: "",
+        pseudo: true,
+        script: "binom",
+      };
+      const close = {
+        text: "}",
+        x: rightX + 1,
+        y: bot.maxY,
+        width: 0,
+        height: 0,
+        font: "",
+        pseudo: true,
+        script: "binom",
+      };
+
+      const content = new Set([...topBand, ...botBand]);
+      let insertIdx = Infinity;
+      for (let i = 0; i < frags.length; i++) {
+        if (content.has(frags[i])) insertIdx = Math.min(insertIdx, i);
+      }
+      if (!isFinite(insertIdx)) return false;
+      const rebuilt = [];
+      for (let i = 0; i < frags.length; i++) {
+        if (i === insertIdx) {
+          rebuilt.push(open, ...topBand, splitter, ...botBand, close);
+        }
+        if (!content.has(frags[i])) rebuilt.push(frags[i]);
+      }
+      frags.splice(0, frags.length, ...rebuilt);
+      return true;
+    };
+
+    const refreshLineBounds = (line) => {
+      let yTop = Infinity;
+      let yBot = -Infinity;
+      for (const f of line.fragments) {
+        if (f.pseudo) continue;
+        yTop = Math.min(yTop, f.y);
+        yBot = Math.max(yBot, f.y + f.height);
+      }
+      if (isFinite(yTop)) {
+        line.yTop = yTop;
+        line.yBot = yBot;
+      }
+    };
+
+    // Sqrt structural detection. The compiler renders \sqrt{x} as a
+    // 1-row table [√ glyph (1.4× pt) | radicand cell (pt) with
+    // border-top vinculum]; canvas reads √ and the radicand as
+    // separate fragments at similar y. The textual decompiler can
+    // only undo the `√(x)` parens form, so without folding here a
+    // bare "√x" leaks through as `\sqrt{x}` (now via the bare-form
+    // fallback in decompiler.js) but multi-glyph radicands (`x²+1`,
+    // anything Docs splits across fillTexts) drop the trailing
+    // glyphs out of the radicand. Repurpose the √ glyph's text to
+    // `\sqrt{` and bracket the next adjacent fragment with a `}`
+    // pseudo so the whole radicand cell ends up inside the braces.
+    for (const line of lines) {
+      let i = 0;
+      while (i < line.fragments.length) {
+        const f = line.fragments[i];
+        if (!f.pseudo && f.text === "√") {
+          let j = i + 1;
+          while (j < line.fragments.length && line.fragments[j].pseudo) j++;
+          if (j < line.fragments.length) {
+            const sqrtRight = f.x + (f.width || 0);
+            const sqrtFontPx = fontPx(f.font);
+            const allowedGap = Math.max(sqrtFontPx * 0.5, 8);
+            let bestIdx = -1;
+            let bestScore = -Infinity;
+            for (let k = j; k < line.fragments.length; k++) {
+              const cand = line.fragments[k];
+              if (cand.pseudo) continue;
+              const candIsOpenParen =
+                cand.text === "(" || cand.text.startsWith("(");
+              if (candIsOpenParen) {
+                bestIdx = k;
+                bestScore = Infinity;
+                break;
+              }
+              const gap = cand.x - sqrtRight;
+              if (gap > allowedGap) break;
+              const overlap = yOverlap(f, cand);
+              const centerPenalty = Math.abs(
+                (f.y + f.height / 2) - (cand.y + cand.height / 2)
+              );
+              const score = overlap - centerPenalty * 0.25;
+              if (score > bestScore) {
+                bestScore = score;
+                bestIdx = k;
+              }
+            }
+            if (bestIdx < 0) { i++; continue; }
+            const r = line.fragments[bestIdx];
+            // Skip folding when the next fragment is `(` — that's
+            // the textual `√(x)` form and the decompiler's
+            // convertSqrt handles it natively. Folding here would
+            // mis-bracket the open paren as the radicand.
+            const nextIsOpenParen = r.text === "(" || r.text.startsWith("(");
+            // Only fold when the next fragment sits flush against
+            // the √ — the compiler's HTML table places them in
+            // adjacent cells with no gap. Allow a few pixels of
+            // measurement slack relative to the √'s font size.
+            const gap = r.x - sqrtRight;
+            if (!nextIsOpenParen && gap <= allowedGap) {
+              f.text = "\\sqrt{";
+              f.script = "sqrt";
+              r.script = "sqrt";
+              const closer = {
+                text: "}",
+                x: r.x + (r.width || 0),
+                y: r.y,
+                width: 0,
+                height: 0,
+                font: "",
+                pseudo: true,
+                script: "sqrt",
+              };
+              line.fragments.splice(bestIdx + 1, 0, closer);
+              i = bestIdx + 2;
+              continue;
+            }
+          }
+        }
+        i++;
+      }
+    }
+
+    // Binom structural detection (inline). The compiler renders
+    // \binom{n}{k} as a 3-col 2-row table with rowspan=2 paren cells
+    // at parenPt = pt × 1.9 wrapping stacked num/den at body pt.
+    // Canvas line clustering folds the four glyphs into one line —
+    // the tall parens vertically overlap both content rows — and the
+    // per-line sup/sub pass tags `n` as sup and `k` as sub purely on
+    // the basis of vertical offset. Without folding here the decompile
+    // source spells the binom as `(^{n}_{k})`, valid but ugly. Scan
+    // every line for ANY tall-paren pair (not just at first/last
+    // position) and fold to `\binom{n}{k}` pseudos. Inline scanning
+    // catches binoms in a sequence with surrounding text and binoms
+    // inside a cases body, both of which are common.
+    //
+    // Tall-paren key: paren height ≥ 1.4× the line's median
+    // non-paren fragment height. Compiler binom parens (1.9×) easily
+    // clear it; a fraction with paren-wrapped numerator (parens at
+    // body pt) does not.
+    for (const line of lines) {
+      foldBinomsInFragments(line.fragments);
+    }
+    for (let li = 0; li < lines.length - 1; li++) {
+      const rows = [lines[li].fragments, lines[li + 1].fragments];
+      if (!foldSplitBinomsInRows(rows)) continue;
+      lines[li].fragments = rows[0] || [];
+      refreshLineBounds(lines[li]);
+      if (rows.length > 1 && rows[1].length) {
+        lines[li + 1].fragments = rows[1];
+        refreshLineBounds(lines[li + 1]);
+      } else {
+        lines.splice(li + 1, 1);
+        li--;
+      }
+    }
+
+    // Cases structural detection. The compiler renders \begin{cases}
+    // with a single rowspan=N `{` glyph at bracePt = max(pt × 1.8,
+    // pt × N × 1.15) on the left, with N value/condition rows to its
+    // right (and any sequence prefix text on a sibling rowspan cell).
+    // Canvas line clustering puts the brace + prefix text + first
+    // cases row together on one logical line (the brace's tall y-span
+    // overlaps row 1) but later rows fall onto separate lines, so the
+    // decompile-range builder breaks the equation into one piece per
+    // row. Merge every line whose y-range overlaps the brace's tall
+    // span into one logical line, partition the body into rows by y
+    // and into columns by x-gap, and emit `\begin{cases}`,
+    // `\end{cases}`, `\\` between rows, and `&` between columns as
+    // pseudos so the entire equation decompiles as a single region
+    // instead of separate-row fragments.
+    //
+    // Detection key: a `{` glyph whose height is ≥ 1.5× the median
+    // height of the line's other (non-brace) fragments. A regular `{`
+    // (literal brace, no rowspan) renders at body pt and never trips
+    // this threshold. Brace-pieces rendering (⎧⎨⎪⎩) from the inline
+    // sequence path is not handled here.
+    {
+      let li = 0;
+      while (li < lines.length) {
+        const line = lines[li];
+        const real = line.fragments.filter((f) => !f.pseudo);
+        if (real.length < 2) { li++; continue; }
+        const otherHs = real
+          .filter((f) => f.text !== "{")
+          .map((f) => f.height)
+          .sort((a, b) => a - b);
+        if (!otherHs.length) { li++; continue; }
+        const medianH = otherHs[Math.floor(otherHs.length / 2)];
+        const brace = real.find(
+          (f) => f.text === "{" && f.height > medianH * 1.5
+        );
+        if (!brace) { li++; continue; }
+
+        const braceTop = brace.y;
+        const braceBot = brace.y + brace.height;
+
+        let lj = li;
+        while (lj + 1 < lines.length) {
+          if (lines[lj + 1].yTop >= braceBot) break;
+          lj++;
+        }
+        // No early bail when lj === li: even when every cases glyph
+        // already y-clusters into one line (the brace's tall y-range
+        // can pull subsequent rows into the same line at the line-
+        // clustering pass), we still need to run cases detection on
+        // that single line — partitioning the body by y, inserting
+        // \\, &, \begin{cases}, \end{cases} pseudos.
+
+        const allFrags = [];
+        for (let k = li; k <= lj; k++) {
+          for (const f of lines[k].fragments) allFrags.push(f);
+        }
+
+        const splitX = brace.x + brace.width / 2;
+        // Cases body x-cap at brace.x + 2.5 × brace.height. The
+        // brace's y-range can overlap content FAR to the right of
+        // the cases sub-table (matrices, binoms following the cases
+        // in a sequence), so without a cap that content gets pulled
+        // into the cases body. Gap-based detection doesn't work
+        // here: the value-to-condition gap inside cases (∼24 px,
+        // from cell padding around a wide value cell + small cond
+        // cell padding) is actually LARGER than the cases-to-next-
+        // sequence-cell gap (∼10 px), so any gap threshold catches
+        // the wrong boundary. A geometric cap of 2.5 × brace.height
+        // covers a typical cases sub-table (brace cell + value cell
+        // + cond cell ≈ 1.2× the brace's height worth of width per
+        // outer row) without reaching far enough to grab a
+        // following matrix or binom in a sequence. Items past the
+        // cap go to `postFrags`, emitted after `\end{cases}` so
+        // matrix detection still gets a crack at them.
+        const xCapRight = brace.x + brace.height * 2.5;
+        // Include pseudos in the prefix too — sqrt's closer `}` and
+        // any other earlier-detection pseudos that sit at x positions
+        // left of the cases brace (e.g. a `\sqrt{...}` before the
+        // cases in a sequence) would otherwise be lost when we
+        // rebuild the line, leaving the outer LaTeX with unmatched
+        // `\sqrt{` / `\binom{` openers. Don't sort by x: detection
+        // passes set pseudo positions relative to their adjacent real
+        // fragments (e.g. `}{` between binom num and den at midpoint
+        // x), and an x-sort can move them past their anchors when
+        // num/den share an x position.
+        const prefix = allFrags.filter(
+          (f) => f !== brace &&
+            (f.x + f.width / 2) < splitX
+        );
+        // bodyAll keeps pseudos so binom's `}{` splitter and other
+        // pre-existing pseudos survive the cases rebuild. Use the
+        // fragment's left edge for the right cap: a long condition can
+        // start inside the cases table while its center falls past the
+        // cap. Center-based clipping drops that whole condition into
+        // post-cases content, where fraction detection later turns it
+        // into stray ^{...}_{...}.
+        const bodyAll = allFrags.filter(
+          (f) => f !== brace &&
+            (f.x + f.width / 2) >= splitX &&
+            f.x <= xCapRight
+        );
+        const bodyReal = bodyAll.filter((f) => !f.pseudo);
+        // Items past the cap belong to the post-cases content stream
+        // (binom, matrix, etc., that follow the cases in a sequence).
+        const postFrags = allFrags.filter(
+          (f) => f !== brace &&
+            (f.x + f.width / 2) >= splitX &&
+            f.x > xCapRight
+        );
+        const postSet = new Set(postFrags);
+        const postLines = [];
+        if (postSet.size) {
+          for (let k = li; k <= lj; k++) {
+            const kept = lines[k].fragments.filter((f) => postSet.has(f));
+            if (!kept.length) continue;
+            let yTop = Infinity;
+            let yBot = -Infinity;
+            for (const f of kept) {
+              if (f.pseudo) continue;
+              yTop = Math.min(yTop, f.y);
+              yBot = Math.max(yBot, f.y + f.height);
+            }
+            if (!isFinite(yTop)) {
+              yTop = lines[k].yTop;
+              yBot = lines[k].yBot;
+            }
+            postLines.push({
+              yTop,
+              yBot,
+              fragments: kept,
+              joinPrev: postLines.length === 0,
+            });
+          }
+        }
+        if (!bodyReal.length) { li++; continue; }
+
+        // Cluster real body fragments into rows by y-range overlap
+        // (>25% of the smaller fragment's height). Same pattern as
+        // the outer line clustering. More forgiving than midpoint
+        // distance for rows that contain a tall nested structure
+        // (e.g. a `\binom` inside a cases row): the binom's tall
+        // paren glyph overlaps both num and den by ~95% of the
+        // smaller height, so all three cluster into one cases row,
+        // while the next cases row's shorter text only overlaps the
+        // binom's bottom by ~10–15% and falls into its own row.
+        const rows = [];
+        const bodyByY = [...bodyReal].sort((a, b) => a.y - b.y);
+        for (const f of bodyByY) {
+          const fTop = f.y;
+          const fBot = f.y + f.height;
+          let placed = false;
+          for (const row of rows) {
+            const oTop = Math.max(row.yMin, fTop);
+            const oBot = Math.min(row.yMax, fBot);
+            const overlap = Math.max(0, oBot - oTop);
+            const minH = Math.min(row.yMax - row.yMin, f.height);
+            if (minH > 0 && overlap > minH * 0.25) {
+              row.frags.push(f);
+              row.yMin = Math.min(row.yMin, fTop);
+              row.yMax = Math.max(row.yMax, fBot);
+              placed = true;
+              break;
+            }
+          }
+          if (!placed) {
+            rows.push({ frags: [f], yMin: fTop, yMax: fBot });
+          }
+        }
+        rows.sort((a, b) => a.yMin - b.yMin);
+
+        // Map each real frag to its row index, then walk bodyAll in
+        // original order to place real and pseudo fragments into
+        // ordered rows. Pseudos inherit the previous real fragment's
+        // row — this is what keeps the binom's `}{` splitter
+        // (inserted by inline binom detection earlier) inside the
+        // cases row that contains the binom, instead of being lost.
+        const fragRowMap = new Map();
+        for (let r = 0; r < rows.length; r++) {
+          for (const f of rows[r].frags) fragRowMap.set(f, r);
+        }
+        const orderedRows = rows.map(() => []);
+        let lastRowIdx = 0;
+        for (const f of bodyAll) {
+          let rowIdx;
+          if (f.pseudo) {
+            rowIdx = lastRowIdx;
+          } else {
+            const lookup = fragRowMap.get(f);
+            rowIdx = lookup != null ? lookup : lastRowIdx;
+          }
+          orderedRows[rowIdx].push(f);
+          lastRowIdx = rowIdx;
+        }
+        foldSplitBinomsInRows(orderedRows);
+        for (const rowFrags of orderedRows) {
+          foldBinomsInFragments(rowFrags);
+          if (!foldStackedBinomsInFragments(rowFrags)) {
+            foldLeadingFlatBinomInFragments(rowFrags);
+          }
+        }
+
+        // Redo sup/sub in local x-clusters, not the whole cases row.
+        // Structural rows can have a binom numerator/denominator and a
+        // separate scripted expression on different baselines.
+        const redoScripts = redoScriptsLocal;
+        redoScripts(prefix);
+        for (const rowFrags of orderedRows) redoScripts(rowFrags);
+
+        // Tag whatever's left as "cases" so it stays in the decompile
+        // run. decompileSource treats "cases" the same as "normal"
+        // (no ^/_ wrapping); only "sup"/"sub" trigger script wrapping.
+        // Skip pseudos — they already carry their own structural
+        // script tags (sqrt, matrix, binom, …) from earlier
+        // detection passes; overwriting them to "cases" loses no
+        // decompile information but the conceptual association
+        // matters if downstream code ever inspects the tag.
+        for (const f of [...prefix, ...bodyReal]) {
+          if (f.pseudo) continue;
+          if (f.script !== "sup" && f.script !== "sub" && f.script !== "binom") {
+            f.script = "cases";
+          }
+        }
+        // Repurpose the brace glyph as `\begin{cases}`. Geometry
+        // stays put — pushBlockUnified reads f.x/f.width/f.height
+        // regardless of f.text — so the visible highlight still
+        // covers the brace's drawn area.
+        brace.text = "\\begin{cases}";
+        brace.script = "cases";
+
+        const pseudo = (text, x, y) => ({
+          text, x, y, width: 0, height: 0, font: "",
+          pseudo: true, script: "cases",
+        });
+
+        // Build new line.fragments. Cases is normally two-column —
+        // value & condition — but the widest gap in a structural value
+        // can be the space after a stacked choose, not the condition
+        // boundary. Collect gap candidates per row, ignore gaps inside
+        // \binom{...}, and prefer a boundary whose x-position is shared
+        // by multiple rows. If no shared boundary exists, fall back to
+        // the row's largest gap.
+        const rowGapCandidates = (rowFrags) => {
+          const out = [];
+          let prevRight = -Infinity;
+          let binomDepth = 0;
+          for (let i = 0; i < rowFrags.length; i++) {
+            const f = rowFrags[i];
+            if (f.text === "\\binom{") {
+              binomDepth++;
+              continue;
+            }
+            if (f.text === "}" && binomDepth > 0) {
+              binomDepth--;
+              continue;
+            }
+            if (f.pseudo) continue;
+            if (binomDepth === 0 && prevRight !== -Infinity) {
+              const gap = f.x - prevRight;
+              if (gap >= 4) out.push({ idx: i, x: f.x, gap });
+            }
+            prevRight = f.x + f.width;
+          }
+          return out;
+        };
+        const gapRows = orderedRows.map(rowGapCandidates);
+        const sharedGap = (() => {
+          const all = [];
+          for (let r = 0; r < gapRows.length; r++) {
+            for (const g of gapRows[r]) all.push({ ...g, row: r });
+          }
+          if (all.length < 2) return null;
+          all.sort((a, b) => a.x - b.x);
+          const clusters = [];
+          const tol = Math.max(10, medianH * 0.8);
+          for (const g of all) {
+            const last = clusters[clusters.length - 1];
+            if (!last || Math.abs(g.x - last.xAvg) > tol) {
+              clusters.push({ items: [g], rows: new Set([g.row]), xAvg: g.x, gap: g.gap });
+            } else {
+              last.items.push(g);
+              last.rows.add(g.row);
+              last.xAvg =
+                last.items.reduce((sum, item) => sum + item.x, 0) /
+                last.items.length;
+              last.gap += g.gap;
+            }
+          }
+          clusters.sort((a, b) => {
+            if (b.rows.size !== a.rows.size) return b.rows.size - a.rows.size;
+            if (b.gap !== a.gap) return b.gap - a.gap;
+            return b.xAvg - a.xAvg;
+          });
+          return clusters[0] && clusters[0].rows.size >= 2 ? clusters[0] : null;
+        })();
+
+        const newFrags = [...prefix, brace];
+        for (let r = 0; r < orderedRows.length; r++) {
+          const rowFrags = orderedRows[r];
+          const gaps = gapRows[r] || [];
+          const aligned = sharedGap
+            ? gaps
+                .filter((g) => Math.abs(g.x - sharedGap.xAvg) <= Math.max(10, medianH * 0.8))
+                .sort((a, b) => Math.abs(a.x - sharedGap.xAvg) - Math.abs(b.x - sharedGap.xAvg))[0]
+            : null;
+          const largest = gaps
+            .slice()
+            .sort((a, b) => b.gap - a.gap)[0];
+          const gapChoice = aligned || largest || null;
+          // Minimum gap for a column boundary. 4px is wider than
+          // any glyph-to-glyph gap inside a single cell (those are
+          // 0–3px from font kerning) and narrower than even the
+          // tightest cell-boundary gap.
+          const insertAndAt = gapChoice && gapChoice.gap >= 4 ? gapChoice.idx : -1;
+          // Second pass: emit fragments, inserting `&` at the
+          // chosen position.
+          for (let i = 0; i < rowFrags.length; i++) {
+            if (i === insertAndAt) {
+              const f = rowFrags[i];
+              newFrags.push(pseudo("&", f.x - 1, f.y));
+            }
+            newFrags.push(rowFrags[i]);
+          }
+          if (r < orderedRows.length - 1) {
+            // Position `\\` after the last real fragment in this row.
+            let lastReal = null;
+            for (let k = rowFrags.length - 1; k >= 0; k--) {
+              if (!rowFrags[k].pseudo) { lastReal = rowFrags[k]; break; }
+            }
+            if (lastReal) {
+              newFrags.push(pseudo(
+                "\\\\",
+                lastReal.x + lastReal.width,
+                lastReal.y
+              ));
+            }
+          }
+        }
+        // \end{cases} after the last real fragment of the last row.
+        const lastRowFrags = orderedRows[orderedRows.length - 1];
+        let lastRealOverall = null;
+        for (let k = lastRowFrags.length - 1; k >= 0; k--) {
+          if (!lastRowFrags[k].pseudo) { lastRealOverall = lastRowFrags[k]; break; }
+        }
+        if (lastRealOverall) {
+          newFrags.push(pseudo(
+            "\\end{cases}",
+            lastRealOverall.x + lastRealOverall.width,
+            lastRealOverall.y + lastRealOverall.height
+          ));
+        }
+        const merged = {
+          yTop: lines[li].yTop,
+          yBot: lines[lj].yBot,
+          fragments: newFrags,
+        };
+        lines.splice(li, lj - li + 1, merged, ...postLines);
+        li++;
+      }
+    }
+
     // Matrix detection runs BEFORE fraction detection. A 2×2 matrix
     // shares the "tight gap, matching x-centers, similar widths" shape
     // of a fraction, so leaving fraction detection to run first would
@@ -2295,8 +3335,26 @@
       // fragments — \s in JS covers ASCII spaces, tabs, and U+00A0.
       const realFrags = (line) =>
         line.fragments.filter((f) => !f.pseudo && /\S/.test(f.text));
-      const centers = (line) =>
-        realFrags(line).map((f) => f.x + f.width / 2);
+      const matrixCandidateFrags = (line) =>
+        realFrags(line).filter((f) =>
+          f.script !== "binom" && !/^[+=]$/.test(f.text)
+        );
+      // Column centers via x-gap clustering — NOT per-fragment.
+      // A cell with a superscript (`a²`, `-a³`, `3a²`) renders as
+      // multiple canvas fragments (base char at body pt, sup glyph
+      // at smaller pt) sitting flush against each other. Counting
+      // fragments per row would give different totals across rows
+      // (e.g. row 1 has 6 frags from 4 cells with sups, row 4 has
+      // 4 frags from 4 plain digit cells), and colsMatch would
+      // reject the mismatch — matrix detection bails and fraction
+      // detection folds row pairs instead. Cluster fragments whose
+      // x-edges sit within 5px of each other into one column
+      // position so a cell's base + sup count as one position
+      // regardless of how Docs split it across fillTexts. 5px
+      // clears the tightest within-cell gap (sup adjacent to base,
+      // gap ≈ 0) and stays well under the cell-to-cell gap in
+      // matrix rendering (≥10–30px from cell padding around
+      // centered content).
       const colsMatch = (a, b) => {
         if (a.length !== b.length || a.length < 2) return false;
         for (let k = 0; k < a.length; k++) {
@@ -2304,66 +3362,545 @@
         }
         return true;
       };
+      // Cluster centers, restricted to fragments whose x-center sits
+      // within [xMin, xMax]. Used to filter out wrapper-prefix
+      // content (a sequence's text cell to the left of the matrix)
+      // that line clustering folded into the same y-band as one of
+      // the matrix rows because the prefix cell is rowspan-vertical-
+      // centered against the matrix's full height — its y-range
+      // overlaps row 2 (or wherever the vertical center lands) by
+      // well over the 25% line-clustering threshold.
+      const centersInRange = (line, xMin, xMax) => {
+        const frags = matrixCandidateFrags(line).filter((f) => {
+          const cx = f.x + f.width / 2;
+          return cx >= xMin && cx <= xMax;
+        });
+        if (!frags.length) return [];
+        const sorted = [...frags].sort((a, b) => a.x - b.x);
+        const out = [];
+        let curr = {
+          minX: sorted[0].x,
+          maxX: sorted[0].x + sorted[0].width,
+        };
+        for (let k = 1; k < sorted.length; k++) {
+          const f = sorted[k];
+          if (f.x - curr.maxX < 5) {
+            if (f.x + f.width > curr.maxX) curr.maxX = f.x + f.width;
+          } else {
+            out.push((curr.minX + curr.maxX) / 2);
+            curr = { minX: f.x, maxX: f.x + f.width };
+          }
+        }
+        out.push((curr.minX + curr.maxX) / 2);
+        return out;
+      };
+      const centerClustersInRange = (line, xMin, xMax) => {
+        const frags = matrixCandidateFrags(line).filter((f) => {
+          const cx = f.x + f.width / 2;
+          return cx >= xMin && cx <= xMax;
+        });
+        if (!frags.length) return [];
+        const sorted = [...frags].sort((a, b) => a.x - b.x);
+        const out = [];
+        let curr = {
+          minX: sorted[0].x,
+          maxX: sorted[0].x + sorted[0].width,
+        };
+        for (let k = 1; k < sorted.length; k++) {
+          const f = sorted[k];
+          if (f.x - curr.maxX < 5) {
+            curr.maxX = Math.max(curr.maxX, f.x + f.width);
+          } else {
+            out.push({ ...curr, cx: (curr.minX + curr.maxX) / 2 });
+            curr = { minX: f.x, maxX: f.x + f.width };
+          }
+        }
+        out.push({ ...curr, cx: (curr.minX + curr.maxX) / 2 });
+        return out;
+      };
+      const splitCenterGroups = (clusters) => {
+        if (clusters.length < 2) return [];
+        const gaps = [];
+        for (let k = 0; k < clusters.length - 1; k++) {
+          gaps.push(Math.max(0, clusters[k + 1].minX - clusters[k].maxX));
+        }
+        const sortedGaps = [...gaps].sort((a, b) => a - b);
+        const medianGap = sortedGaps[Math.floor(sortedGaps.length / 2)] || 0;
+        const splitGap = Math.max(28, medianGap * 1.8);
+        const groups = [];
+        let curr = [clusters[0]];
+        for (let k = 0; k < gaps.length; k++) {
+          if (gaps[k] > splitGap) {
+            if (curr.length >= 2) groups.push(curr);
+            curr = [clusters[k + 1]];
+          } else {
+            curr.push(clusters[k + 1]);
+          }
+        }
+        if (curr.length >= 2) groups.push(curr);
+        return groups;
+      };
+      const splitGroupsAtOperators = (groups, clusters, start) => {
+        if (groups.length !== 1 || clusters.length < 4) return groups;
+        const scanEnd = Math.min(lines.length - 1, start + 5);
+        for (let r = start; r <= scanEnd; r++) {
+          for (const f of realFrags(lines[r])) {
+            if (!/^[+=]$/.test(f.text)) continue;
+            const cx = f.x + f.width / 2;
+            for (let k = 0; k < clusters.length - 1; k++) {
+              if (cx <= clusters[k].maxX || cx >= clusters[k + 1].minX) {
+                continue;
+              }
+              const left = clusters.slice(0, k + 1);
+              const right = clusters.slice(k + 1);
+              if (left.length >= 2 && right.length >= 2) {
+                return [left, right];
+              }
+            }
+          }
+        }
+        return groups;
+      };
+
       let i = 0;
       while (i < lines.length) {
         const start = i;
-        const baseCenters = centers(lines[start]);
-        if (baseCenters.length < 2) { i++; continue; }
-        let end = start;
-        while (end + 1 < lines.length) {
-          const A = lines[end];
-          const B = lines[end + 1];
-          // Slightly looser gap than fractions: matrix rows in Docs have
-          // a table-row gap of a couple px even at line-height:1.
-          if (B.yTop - A.yBot > 6) break;
-          if (!colsMatch(baseCenters, centers(B))) break;
-          end++;
+        if (lines[start].fragments.some(
+          (f) => f.script === "cases" ||
+            f.text === "\\begin{cases}" ||
+            f.text === "\\end{cases}"
+        )) {
+          i++;
+          continue;
         }
-        if (end === start) { i++; continue; }
+        const baseClusters = centerClustersInRange(
+          lines[start],
+          -Infinity,
+          Infinity
+        );
+        const baseGroups = splitGroupsAtOperators(
+          splitCenterGroups(baseClusters),
+          baseClusters,
+          start
+        );
+        if (!baseGroups.length) { i++; continue; }
 
-        const rowCount = end - start + 1;
+        const candidates = [];
+        for (let gi = 0; gi < baseGroups.length; gi++) {
+          const group = baseGroups[gi];
+          const baseCenters = group.map((c) => c.cx);
+          // Establish each matrix's x-range from one horizontal group.
+          // When two matrices are siblings in a wrapper table, the top
+          // row exposes both sets of columns; the large inter-block gap
+          // splits them so the plus sign between them stays outside.
+          const prev = baseGroups[gi - 1];
+          const next = baseGroups[gi + 1];
+          const leftGap = prev
+            ? group[0].minX - prev[prev.length - 1].maxX
+            : Infinity;
+          const rightGap = next
+            ? next[0].minX - group[group.length - 1].maxX
+            : Infinity;
+          const leftPad = prev ? Math.min(18, leftGap / 3) : 30;
+          const rightPad = next ? Math.min(18, rightGap / 3) : 30;
+          const xMin = group[0].minX - leftPad;
+          const xMax = group[group.length - 1].maxX + rightPad;
+          let end = start;
+          while (end + 1 < lines.length) {
+            const B = lines[end + 1];
+            let lastMatrixLine = lines[end];
+            for (let k = end; k >= start; k--) {
+              const c = centersInRange(lines[k], xMin, xMax);
+              if (c.length > 0) { lastMatrixLine = lines[k]; break; }
+            }
+            const gap = B.yTop - lastMatrixLine.yBot;
+            if (gap > 30) break;
+            const bCenters = centersInRange(B, xMin, xMax);
+            if (bCenters.length === 0) {
+              end++;
+              continue;
+            }
+            if (!colsMatch(baseCenters, bCenters)) break;
+            end++;
+          }
+          if (end > start) {
+            candidates.push({ xMin, xMax, start, end, baseCenters });
+          }
+        }
+        if (!candidates.length) { i++; continue; }
+
+        candidates.sort((a, b) => a.xMin - b.xMin);
+        const overallEnd = candidates.reduce(
+          (m, c) => Math.max(m, c.end),
+          start
+        );
         const pseudo = (text, x, y) => ({
           text, x, y, width: 0, height: 0, font: "",
           pseudo: true, script: "matrix",
         });
-
-        const firstLine = lines[start];
-        const lastLine = lines[end];
-        const flat = [];
-        flat.push(pseudo("\\begin{bmatrix}", firstLine.fragments[0].x, firstLine.yTop));
-        for (let r = 0; r < rowCount; r++) {
-          const row = realFrags(lines[start + r]);
-          for (let c = 0; c < row.length; c++) {
-            if (c > 0) flat.push(pseudo("&", row[c].x, row[c].y));
-            // Cells with plain ASCII content would otherwise have no
-            // decompileable glyphs and fall out of the decompile run
-            // mid-matrix. Tag them "matrix" so tokenHasDecomp keeps the
-            // whole region together; sup/sub cells retain their script
-            // annotation so ^{…}/_{…} still wraps them correctly.
-            if (row[c].script !== "sup" && row[c].script !== "sub") {
-              row[c].script = "matrix";
+        const inCandidate = (cand, f) => {
+          const cx = f.x + f.width / 2;
+          return cx >= cand.xMin && cx <= cand.xMax;
+        };
+        const clusterRow = (frags) => {
+          if (!frags.length) return [];
+          const sorted = [...frags].sort((a, b) => a.x - b.x);
+          const out = [];
+          let curr = null;
+          let lastRight = -Infinity;
+          for (const f of sorted) {
+            if (f.pseudo) {
+              if (!curr) { curr = []; out.push(curr); }
+              curr.push(f);
+              continue;
             }
-            flat.push(row[c]);
+            if (!curr || f.x - lastRight >= 5) {
+              curr = [f];
+              out.push(curr);
+            } else {
+              curr.push(f);
+            }
+            lastRight = Math.max(lastRight, f.x + f.width);
           }
-          if (r < rowCount - 1) {
-            const refY = lines[start + r].yBot;
-            flat.push(pseudo("\\\\", row[row.length - 1].x, refY));
+          return out;
+        };
+        const buildMatrixFlat = (cand) => {
+          const matrixRowsAll = [];
+          for (let r = cand.start; r <= cand.end; r++) {
+            const rowAll = lines[r].fragments.filter(
+              (f) => inCandidate(cand, f) &&
+                (f.pseudo || /\S/.test(f.text))
+            );
+            const rowReal = rowAll.filter((f) => !f.pseudo);
+            if (!rowReal.length) continue;
+            const sortedY = [...rowReal].sort((a, b) => a.y - b.y);
+            const rowYGroups = [];
+            for (const f of sortedY) {
+              const fTop = f.y;
+              const fBot = f.y + f.height;
+              let placed = false;
+              for (const g of rowYGroups) {
+                const oTop = Math.max(g.yMin, fTop);
+                const oBot = Math.min(g.yMax, fBot);
+                const overlap = Math.max(0, oBot - oTop);
+                const minH = Math.min(g.yMax - g.yMin, f.height);
+                if (minH > 0 && overlap > minH * 0.25) {
+                  g.frags.push(f);
+                  g.yMin = Math.min(g.yMin, fTop);
+                  g.yMax = Math.max(g.yMax, fBot);
+                  placed = true;
+                  break;
+                }
+              }
+              if (!placed) {
+                rowYGroups.push({ frags: [f], yMin: fTop, yMax: fBot });
+              }
+            }
+            const fragToRow = new Map();
+            for (let y = 0; y < rowYGroups.length; y++) {
+              for (const f of rowYGroups[y].frags) fragToRow.set(f, y);
+            }
+            const ordered = rowYGroups.map(() => []);
+            let lastRow = 0;
+            for (const f of rowAll) {
+              let rowIdx;
+              if (f.pseudo) {
+                let best = lastRow;
+                let bestDist = Infinity;
+                const fy = f.y || (rowYGroups[lastRow] || {}).yMin || 0;
+                for (let y = 0; y < rowYGroups.length; y++) {
+                  const mid = (rowYGroups[y].yMin + rowYGroups[y].yMax) / 2;
+                  const dist = Math.abs(fy - mid);
+                  if (dist < bestDist) { bestDist = dist; best = y; }
+                }
+                rowIdx = best;
+              } else {
+                rowIdx = fragToRow.get(f);
+                if (rowIdx == null) rowIdx = lastRow;
+              }
+              ordered[rowIdx].push(f);
+              lastRow = rowIdx;
+            }
+            for (const row of ordered) matrixRowsAll.push(row);
           }
+          const out = [
+            pseudo("\\begin{bmatrix}", cand.xMin, lines[cand.start].yTop),
+          ];
+          let lastRowClusters = [];
+          for (let mr = 0; mr < matrixRowsAll.length; mr++) {
+            const cells = clusterRow(matrixRowsAll[mr]);
+            for (let c = 0; c < cells.length; c++) {
+              if (c > 0) {
+                const cell = cells[c];
+                out.push(pseudo("&", cell[0].x, cell[0].y));
+              }
+              redoScriptsLocal(cells[c]);
+              for (const f of cells[c]) {
+                if (f.script !== "sup" && f.script !== "sub") {
+                  f.script = "matrix";
+                }
+                out.push(f);
+              }
+            }
+            if (mr < matrixRowsAll.length - 1 && cells.length > 0) {
+              const lastCell = cells[cells.length - 1];
+              const lastFrag = lastCell[lastCell.length - 1];
+              out.push(pseudo(
+                "\\\\",
+                lastFrag.x + (lastFrag.width || 0),
+                lastFrag.y
+              ));
+            }
+            if (mr === matrixRowsAll.length - 1) lastRowClusters = cells;
+          }
+          const tailX = lastRowClusters.length
+            ? (() => {
+                const lastCell = lastRowClusters[lastRowClusters.length - 1];
+                const lastFrag = lastCell[lastCell.length - 1];
+                return lastFrag.x + (lastFrag.width || 0);
+              })()
+            : cand.xMax;
+          out.push(pseudo("\\end{bmatrix}", tailX, lines[cand.end].yBot));
+          return out;
+        };
+        const flat = [];
+        const emitLoose = (left, right) => {
+          const loose = [];
+          for (let r = start; r <= overallEnd; r++) {
+            for (const f of lines[r].fragments) {
+              const cx = f.x + f.width / 2;
+              if (cx < left || cx >= right) continue;
+              if (candidates.some((cand) => inCandidate(cand, f))) continue;
+              loose.push(f);
+            }
+          }
+          if (!loose.length) return;
+          redoScriptsLocal(loose);
+          for (const f of loose) {
+            if (!f.pseudo && f.script !== "sup" && f.script !== "sub") {
+              f.script = "matrix";
+            }
+            flat.push(f);
+          }
+        };
+
+        let cursorX = -Infinity;
+        for (const cand of candidates) {
+          emitLoose(cursorX, cand.xMin);
+          flat.push(...buildMatrixFlat(cand));
+          cursorX = cand.xMax;
         }
-        const lastRow = realFrags(lastLine);
-        const tailX = lastRow.length
-          ? lastRow[lastRow.length - 1].x + (lastRow[lastRow.length - 1].width || 0)
-          : lastLine.fragments[0].x;
-        flat.push(pseudo("\\end{bmatrix}", tailX, lastLine.yBot));
+        emitLoose(cursorX, Infinity);
 
         const merged = {
-          yTop: firstLine.yTop,
-          yBot: lastLine.yBot,
+          yTop: lines[start].yTop,
+          yBot: lines[overallEnd].yBot,
           fragments: flat,
+          joinPrev: !!lines[start].joinPrev,
         };
-        lines.splice(start, rowCount, merged);
+        lines.splice(start, overallEnd - start + 1, merged);
         i = start + 1;
       }
+    }
+
+    // Inline fractions inside a tall wrapper row (for example
+    // `cases + \frac{2}{2} + 3`) come back as two physical rows, but the
+    // top row also contains the loose siblings (`+` and `+3`). The generic
+    // whole-line fraction detector below rejects that because the top
+    // row's center/width no longer matches the denominator. Match just
+    // the centered numerator/denominator clusters and leave the loose
+    // siblings in place.
+    const hasStructuralFragments = (line) =>
+      line.fragments.some((f) =>
+        f.script === "cases" ||
+        f.script === "matrix" ||
+        f.script === "binom" ||
+        f.text === "\\begin{cases}" ||
+        f.text === "\\end{cases}" ||
+        f.text === "\\begin{bmatrix}" ||
+        f.text === "\\end{bmatrix}"
+      );
+    const clusterPlainRuns = (frags) => {
+      const out = [];
+      const real = frags
+        .filter((f) => !f.pseudo && /\S/.test(f.text || ""))
+        .sort((a, b) => a.x - b.x);
+      let curr = null;
+      let lastRight = -Infinity;
+      const isOperator = (f) => /^[+=]$/.test(f.text || "");
+      for (const f of real) {
+        if (isOperator(f)) {
+          curr = null;
+          lastRight = -Infinity;
+          continue;
+        }
+        const gap = curr ? f.x - lastRight : Infinity;
+        if (!curr || gap > Math.max(5, fontPx(f.font) * 0.4)) {
+          curr = {
+            frags: [f],
+            minX: f.x,
+            maxX: f.x + f.width,
+            minY: f.y,
+            maxY: f.y + f.height,
+          };
+          out.push(curr);
+        } else {
+          curr.frags.push(f);
+          curr.maxX = Math.max(curr.maxX, f.x + f.width);
+          curr.minY = Math.min(curr.minY, f.y);
+          curr.maxY = Math.max(curr.maxY, f.y + f.height);
+        }
+        lastRight = Math.max(lastRight, f.x + f.width);
+      }
+      for (const c of out) {
+        c.cx = (c.minX + c.maxX) / 2;
+        c.cy = (c.minY + c.maxY) / 2;
+        c.w = Math.max(1, c.maxX - c.minX);
+        c.frags.sort((a, b) => a.x - b.x);
+        c.text = c.frags.map((f) => f.text || "").join("").replace(/\s+/g, "");
+      }
+      return out;
+    };
+    const plainFractionText = (text) =>
+      /^[A-Za-z0-9]+(?:[-+][A-Za-z0-9]+)*$/.test(text || "");
+    const foldSameLineInlineFraction = (line) => {
+      if (hasStructuralFragments(line)) return false;
+      const topFrags = line.fragments.filter((f) => !f.pseudo && f.script === "sup");
+      const botFrags = line.fragments.filter((f) => !f.pseudo && f.script === "sub");
+      if (!topFrags.length || !botFrags.length) return false;
+
+      const topClusters = clusterPlainRuns(topFrags).filter((c) => plainFractionText(c.text));
+      const botClusters = clusterPlainRuns(botFrags).filter((c) => plainFractionText(c.text));
+      let best = null;
+      for (const top of topClusters) {
+        for (const bot of botClusters) {
+          const centerDelta = Math.abs(top.cx - bot.cx);
+          const centerTol = Math.max(8, Math.max(top.w, bot.w) * 0.45);
+          if (centerDelta > centerTol) continue;
+          const wr = Math.max(top.w, 1) / Math.max(bot.w, 1);
+          if (wr < 0.2 || wr > 5) continue;
+          const score = centerDelta + Math.abs(Math.log(wr)) * 4;
+          if (!best || score < best.score) best = { top, bot, score };
+        }
+      }
+      if (!best) return false;
+
+      const pseudo = (text, x, y) => ({
+        text, x, y, width: 0, height: 0, font: "",
+        pseudo: true, script: "fraction",
+      });
+      for (const f of [...best.top.frags, ...best.bot.frags]) {
+        f.script = "fraction";
+      }
+      const matchedTop = new Set(best.top.frags);
+      const matchedBot = new Set(best.bot.frags);
+      const rebuilt = [];
+      let inserted = false;
+      for (const f of line.fragments) {
+        if (matchedTop.has(f)) {
+          if (!inserted) {
+            rebuilt.push(
+              pseudo("(", best.top.minX, best.top.minY),
+              ...best.top.frags,
+              pseudo(")/(", best.bot.minX, (best.top.maxY + best.bot.minY) / 2),
+              ...best.bot.frags,
+              pseudo(")", best.bot.maxX, best.bot.maxY)
+            );
+            inserted = true;
+          }
+          continue;
+        }
+        if (matchedBot.has(f)) continue;
+        if (!f.pseudo &&
+            (f.script === "sup" || f.script === "sub") &&
+            (/^[+=]/.test(f.text || "") || /^[0-9]+$/.test(f.text || ""))) {
+          f.script = "normal";
+        }
+        rebuilt.push(f);
+      }
+      if (!inserted) return false;
+      line.fragments = rebuilt;
+      refreshLineBounds(line);
+      return true;
+    };
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const prev = i > 0 ? lines[i - 1] : null;
+      const nearCases =
+        !!line.joinPrev ||
+        !!(prev && prev.fragments.some((f) => f.text === "\\end{cases}"));
+      if (nearCases) foldSameLineInlineFraction(line);
+    }
+
+    for (let i = 0; i < lines.length - 1; i++) {
+      const A = lines[i];
+      const B = lines[i + 1];
+      const prev = i > 0 ? lines[i - 1] : null;
+      const nearCases =
+        !!A.joinPrev ||
+        !!(prev && prev.fragments.some((f) => f.text === "\\end{cases}"));
+      if (!nearCases) continue;
+      if (B.yTop - A.yBot > 18) continue;
+      if (hasStructuralFragments(A) || hasStructuralFragments(B)) continue;
+
+      const topClusters = clusterPlainRuns(A.fragments).filter((c) => plainFractionText(c.text));
+      const botClusters = clusterPlainRuns(B.fragments).filter((c) => plainFractionText(c.text));
+      let best = null;
+      for (const top of topClusters) {
+        for (const bot of botClusters) {
+          const centerDelta = Math.abs(top.cx - bot.cx);
+          const centerTol = Math.max(8, Math.max(top.w, bot.w) * 0.45);
+          if (centerDelta > centerTol) continue;
+          const wr = Math.max(top.w, 1) / Math.max(bot.w, 1);
+          if (wr < 0.2 || wr > 5) continue;
+          const score = centerDelta + Math.abs(Math.log(wr)) * 4;
+          if (!best || score < best.score) best = { top, bot, score };
+        }
+      }
+      if (!best) continue;
+
+      const pseudo = (text, x, y) => ({
+        text, x, y, width: 0, height: 0, font: "",
+        pseudo: true, script: "fraction",
+      });
+      for (const f of [...best.top.frags, ...best.bot.frags]) {
+        f.script = "fraction";
+      }
+      const matchedTop = new Set(best.top.frags);
+      const matchedBot = new Set(best.bot.frags);
+      const rebuilt = [];
+      let inserted = false;
+      for (const f of A.fragments) {
+        if (matchedTop.has(f)) {
+          if (!inserted) {
+            rebuilt.push(
+              pseudo("(", best.top.minX, best.top.minY),
+              ...best.top.frags,
+              pseudo(")/(", best.bot.minX, (A.yBot + B.yTop) / 2),
+              ...best.bot.frags,
+              pseudo(")", best.bot.maxX, best.bot.maxY)
+            );
+            inserted = true;
+          }
+          continue;
+        }
+        if (!f.pseudo && f.script !== "fraction") f.script = "normal";
+        rebuilt.push(f);
+      }
+      if (!inserted) continue;
+
+      const remainingB = B.fragments.filter((f) => !matchedBot.has(f));
+      A.fragments = rebuilt;
+      A.yTop = Math.min(A.yTop, B.yTop);
+      A.yBot = Math.max(A.yBot, B.yBot);
+      if (remainingB.some((f) => !f.pseudo)) {
+        B.fragments = remainingB;
+        refreshLineBounds(B);
+      } else {
+        lines.splice(i + 1, 1);
+      }
+      refreshLineBounds(A);
     }
 
     // Fraction detection: two adjacent lines with a near-zero vertical
@@ -2393,6 +3930,7 @@
     for (let i = 0; i < lines.length - 1; i++) {
       const A = lines[i];
       const B = lines[i + 1];
+      if (hasStructuralFragments(A) || hasStructuralFragments(B)) continue;
       const gap = B.yTop - A.yBot;
       // Prose line-spacing at 11pt Arial runs 8–12 CSS px of
       // glyph-bottom-to-next-glyph-top once you account for actual
@@ -2459,7 +3997,9 @@
     deduped.length = 0;
     const lineBoundaryFrags = new Set();
     for (const line of lines) {
-      if (deduped.length > 0) lineBoundaryFrags.add(deduped.length);
+      if (deduped.length > 0 && !line.joinPrev) {
+        lineBoundaryFrags.add(deduped.length);
+      }
       for (const f of line.fragments) deduped.push(f);
     }
 
@@ -2620,6 +4160,146 @@
           rectsOut.push({ cssLeft, cssTop, cssWidth, cssHeight });
         }
         if (marksOut) marksOut.push({ box: mark, under });
+      }
+    }
+
+    // Decompile-region variant of pushBlock. Emits ONE visual mark per
+    // logical line (no matter how many fragments / matrix cells it
+    // contains) so a 2×2 matrix shows a single underline beneath the
+    // whole table instead of four under-each-cell underlines.
+    //
+    // For hit-testing and selection-drag (regionAtPoint /
+    // selectRegionOnCanvas), per-physical-row rects are still pushed
+    // to rectsOut. Within a merged-line segment (e.g. one matrix),
+    // fragments are clustered by y-overlap into rows; each row's
+    // bounding rect covers the entire row width so gaps between cells
+    // count as part of the region, and the first/last rects in
+    // rectsOut span from the top row to the bottom row so the drag
+    // selection covers the whole matrix.
+    function pushBlockUnified(ra, rb, bg, border, rectsOut, marksOut) {
+      const segments = [];
+      let curr = null;
+
+      const overlapsRow = (row, fTop, fBot) => {
+        const oTop = Math.max(row.minY, fTop);
+        const oBot = Math.min(row.maxY, fBot);
+        if (oBot <= oTop) return false;
+        return (oBot - oTop) >
+          0.25 * Math.min(row.maxY - row.minY, fBot - fTop);
+      };
+
+      const closeSegment = () => {
+        if (curr && curr.rows.length) segments.push(curr);
+        curr = null;
+      };
+
+      for (let fi = 0; fi < deduped.length; fi++) {
+        const fs = fragStarts[fi];
+        const f = deduped[fi];
+        if (f.pseudo) continue;
+        const L = f.text.length;
+        const localStart = Math.max(0, ra - fs);
+        const localEnd = Math.min(L, rb - fs);
+        if (localStart >= localEnd) continue;
+
+        if (lineBoundaryFrags.has(fi)) closeSegment();
+
+        const fragLeft = f.x / sx;
+        const fragTop = f.y / sy;
+        const fragWidth = f.width / sx;
+        const fragHeight = f.height / sy;
+
+        scratch.font = f.font;
+        const totalW = scratch.measureText(f.text).width;
+        if (!totalW) continue;
+
+        const prefixW = localStart === 0
+          ? 0
+          : scratch.measureText(f.text.slice(0, localStart)).width;
+        const rightW = localEnd === L
+          ? totalW
+          : scratch.measureText(f.text.slice(0, localEnd)).width;
+        const fracStart = prefixW / totalW;
+        const fracEnd = rightW / totalW;
+
+        const cssLeft = fragLeft + fragWidth * fracStart;
+        const cssTop = fragTop;
+        const cssWidth = fragWidth * (fracEnd - fracStart);
+        const cssHeight = fragHeight;
+
+        if (!curr) curr = { rows: [] };
+
+        let row = null;
+        for (const r of curr.rows) {
+          if (overlapsRow(r, cssTop, cssTop + cssHeight)) { row = r; break; }
+        }
+        if (!row) {
+          curr.rows.push({
+            minX: cssLeft,
+            minY: cssTop,
+            maxX: cssLeft + cssWidth,
+            maxY: cssTop + cssHeight,
+          });
+        } else {
+          if (cssLeft < row.minX) row.minX = cssLeft;
+          if (cssTop < row.minY) row.minY = cssTop;
+          if (cssLeft + cssWidth > row.maxX) row.maxX = cssLeft + cssWidth;
+          if (cssTop + cssHeight > row.maxY) row.maxY = cssTop + cssHeight;
+        }
+      }
+      closeSegment();
+
+      for (const seg of segments) {
+        seg.rows.sort((a, b) => a.minY - b.minY);
+
+        let bMinX = Infinity, bMinY = Infinity;
+        let bMaxX = -Infinity, bMaxY = -Infinity;
+        for (const r of seg.rows) {
+          if (r.minX < bMinX) bMinX = r.minX;
+          if (r.minY < bMinY) bMinY = r.minY;
+          if (r.maxX > bMaxX) bMaxX = r.maxX;
+          if (r.maxY > bMaxY) bMaxY = r.maxY;
+        }
+        const cssLeft = bMinX;
+        const cssTop = bMinY;
+        const cssWidth = bMaxX - bMinX;
+        const cssHeight = bMaxY - bMinY;
+
+        const mark = document.createElement("div");
+        Object.assign(mark.style, {
+          position: "absolute",
+          left: cssLeft + "px",
+          top: cssTop + "px",
+          width: cssWidth + "px",
+          height: cssHeight + "px",
+          background: bg,
+          transition: "background 120ms ease",
+        });
+        const under = document.createElement("div");
+        Object.assign(under.style, {
+          position: "absolute",
+          left: "0px",
+          top: (cssHeight + 2) + "px",
+          width: "100%",
+          height: "4px",
+          background: border,
+          borderRadius: "2px",
+          transition: "background 120ms ease",
+        });
+        mark.appendChild(under);
+        nodes.push(mark);
+        if (marksOut) marksOut.push({ box: mark, under });
+
+        if (rectsOut) {
+          for (const r of seg.rows) {
+            rectsOut.push({
+              cssLeft: r.minX,
+              cssTop: r.minY,
+              cssWidth: r.maxX - r.minX,
+              cssHeight: r.maxY - r.minY,
+            });
+          }
+        }
       }
     }
 
@@ -2817,7 +4497,7 @@
     for (const [ra, rb] of decompileRanges) {
       const rects = [];
       const marks = [];
-      pushBlock(ra, rb, decompileBg, decompileBorder, rects, marks);
+      pushBlockUnified(ra, rb, decompileBg, decompileBorder, rects, marks);
       if (rects.length) {
         regionsOut.push({
           type: "decompile",
@@ -3231,45 +4911,134 @@
     const rects = region.viewportRects || [];
     if (!rects.length) { LOG("region has no viewport rects"); return false; }
 
-    // Drag from the first rect's left edge to the last rect's right edge.
-    // Insetting by a hair keeps the hits inside the glyph boxes.
+    // Drag from the region's left edge to its right edge. For compile
+    // (green) regions and inline decompile, insetting by a hair keeps
+    // the hits inside the glyph boxes.
+    //
+    // For decompile regions covering structural blocks (matrix, frac,
+    // binom, sqrt, cases — and the outer buildNestedSequenceHTML
+    // wrapper that holds a prefix-text cell next to the structural
+    // block) the canvas glyph rects only mark cell text. Bracket
+    // borders, paren glyphs (when CSS), fraction bars, vinculum
+    // strokes, and the wrapper table chrome are non-glyph CSS, so a
+    // drag bounded by cell text alone makes Docs treat the paste as
+    // a within-cell content replacement — the inner table's content
+    // gets overwritten but the wrapper table persists, leaving the
+    // LaTeX source split across two cells.
+    //
+    // To make the paste delete the entire structure (wrapper and
+    // all), overshoot the envelope horizontally well past the
+    // wrapper's left/right edges AND vertically well past its
+    // top/bottom — even a single-row pushBlockUnified output (which
+    // happens when a tall structural glyph like the cases brace
+    // y-bridges multiple visual rows during clustering) needs the
+    // drag to span the full vertical extent or the cursor never
+    // crosses out of the inner cell. Compute the envelope across
+    // ALL rects and ALWAYS use envTop/envBottom for table regions —
+    // not the row-center fallback that's appropriate only for inline
+    // text decompile.
+    const isDecompile = region.type === "decompile";
+    const text = (region.text || "");
+    const containsTable = isDecompile &&
+      /\\begin\{|\\binom\{|\\frac\{|\\sqrt\{/.test(text);
+    const xPad = containsTable ? 40 : 0;
+    const yPad = containsTable ? 20 : 0;
+
+    let envLeft = Infinity, envRight = -Infinity;
+    let envTop = Infinity, envBottom = -Infinity;
+    for (const r of rects) {
+      if (r.left < envLeft) envLeft = r.left;
+      if (r.right > envRight) envRight = r.right;
+      if (r.top < envTop) envTop = r.top;
+      if (r.bottom > envBottom) envBottom = r.bottom;
+    }
+
     const first = rects[0];
     const last = rects[rects.length - 1];
-    const x1 = first.left + 0.5;
-    const y1 = (first.top + first.bottom) / 2;
-    const x2 = last.right - 0.5;
-    const y2 = (last.top + last.bottom) / 2;
-    LOG("dragging selection", { x1, y1, x2, y2 });
+    const x1 = envLeft + 0.5 - xPad;
+    const y1 = containsTable
+      ? envTop - yPad
+      : (first.top + first.bottom) / 2;
+    const x2 = envRight - 0.5 + xPad;
+    const y2 = containsTable
+      ? envBottom + yPad
+      : (last.top + last.bottom) / 2;
+    LOG("dragging selection", { x1, y1, x2, y2, containsTable });
 
     const common = {
       bubbles: true, cancelable: true, composed: true, view: window,
       button: 0, pointerId: 1, pointerType: "mouse", isPrimary: true,
     };
-    const send = (type, x, y, buttons) => {
+    const send = (type, x, y, buttons, detail) => {
       const init = { ...common, clientX: x, clientY: y, buttons };
+      if (detail != null) init.detail = detail;
       try {
         const E = type.startsWith("pointer") ? PointerEvent : MouseEvent;
         canvas.dispatchEvent(new E(type, init));
       } catch (_) {}
     };
 
-    // Collapse any pre-existing selection with a bare click. Docs
-    // treats pointerdown-inside-an-active-selection as the start of a
-    // text drag-and-drop, not a new selection — so if the user had
-    // part of this region highlighted when they clicked Compile, the
-    // drag below wouldn't change the selection and the paste would
-    // replace only their partial highlight. The sleep keeps the
-    // drag-start from being coalesced into a double-click, which
-    // would select by word instead of by character.
-    send("pointerdown", x1, y1, 1);
-    send("mousedown",   x1, y1, 1);
-    send("pointerup",   x1, y1, 0);
-    send("mouseup",     x1, y1, 0);
-    await sleep(550);
+    if (containsTable) {
+      // Double-click + drag = word-by-word selection mode in Docs,
+      // which treats entire tables (including the outer
+      // buildNestedSequenceHTML wrapper) as units. Dragging across
+      // the table's area then selects the table as a whole —
+      // confirmed empirically: this is the gesture the user uses
+      // manually to delete a wrapper table.
+      //
+      // Critical: synthetic mousedown/mouseup do NOT auto-fire
+      // `click`/`dblclick` events the way real input does (Chrome
+      // suppresses this for security). So we have to dispatch
+      // `click` and `dblclick` explicitly — without them Docs only
+      // sees a stream of single mousedown/mouseup pairs and never
+      // engages word-selection mode. detail increments (1, 2, 3)
+      // so any listener gating on click count also picks it up.
+      //
+      // Sequence: full single-click → pause → full double-click
+      // (with explicit `dblclick` event) → pause → triple-click's
+      // mousedown without release; the drag-and-release continues
+      // from there.
+      send("pointerdown", x1, y1, 1, 1);
+      send("mousedown",   x1, y1, 1, 1);
+      send("pointerup",   x1, y1, 0, 1);
+      send("mouseup",     x1, y1, 0, 1);
+      send("click",       x1, y1, 0, 1);
+      await sleep(40);
 
-    send("pointerdown", x1, y1, 1);
-    send("mousedown",   x1, y1, 1);
-    await sleep(30);
+      send("pointerdown", x1, y1, 1, 2);
+      send("mousedown",   x1, y1, 1, 2);
+      send("pointerup",   x1, y1, 0, 2);
+      send("mouseup",     x1, y1, 0, 2);
+      send("click",       x1, y1, 0, 2);
+      send("dblclick",    x1, y1, 0, 2);
+      await sleep(40);
+
+      // Triple click — Docs sometimes promotes word selection to
+      // paragraph (which contains the whole table block) on the
+      // third click. The drag continues from this third mousedown
+      // without releasing.
+      send("pointerdown", x1, y1, 1, 3);
+      send("mousedown",   x1, y1, 1, 3);
+      await sleep(30);
+    } else {
+      // Collapse any pre-existing selection with a bare click. Docs
+      // treats pointerdown-inside-an-active-selection as the start of a
+      // text drag-and-drop, not a new selection — so if the user had
+      // part of this region highlighted when they clicked Compile, the
+      // drag below wouldn't change the selection and the paste would
+      // replace only their partial highlight. The 550ms sleep keeps
+      // the drag-start from being coalesced into a double-click,
+      // which would select by word instead of by character.
+      send("pointerdown", x1, y1, 1, 1);
+      send("mousedown",   x1, y1, 1, 1);
+      send("pointerup",   x1, y1, 0, 1);
+      send("mouseup",     x1, y1, 0, 1);
+      await sleep(550);
+
+      send("pointerdown", x1, y1, 1, 1);
+      send("mousedown",   x1, y1, 1, 1);
+      await sleep(30);
+    }
     // A couple of intermediate moves help drag-selection handlers that
     // only kick in once motion is detected.
     send("pointermove", (x1 + x2) / 2, (y1 + y2) / 2, 1);
@@ -3303,16 +5072,34 @@
     let text, html;
     if (region.type === "decompile") {
       // Unicode → LaTeX source, wrapped in \(...\) so the resulting
-      // text is immediately eligible to compile again. No text/html
-      // variant — LaTeX source is literal characters that Docs should
-      // insert verbatim, not formatted content.
+      // text is immediately eligible to compile again. Pair the
+      // text/plain with a block-level `<p>` text/html variant —
+      // Docs' paste importer treats a `<p>` paste as a paragraph
+      // replacement, which flushes any wrapper table the cursor was
+      // sitting inside (the buildNestedSequenceHTML wrapper around a
+      // cases / matrix block, and the inner structural table). A
+      // plain-text paste over a multi-cell selection only replaces
+      // cell content and leaves the wrapper standing.
       const src = region.text || "";
       const toLatex =
         typeof window.unicodeToLatex === "function"
           ? window.unicodeToLatex
           : (x) => x;
       text = "\\(" + toLatex(src) + "\\)";
-      html = null;
+      const escapeHTML = (s) => s
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+      // `<p>` makes Docs treat the paste as a paragraph-level
+      // replacement (which is what flushes the wrapping table),
+      // but Docs' default paragraph styling adds space-before that
+      // pushes any subsequently-pasted matrix's first row down,
+      // making it look "tall". Inline margin:0 / line-height:1 /
+      // padding:0 on the paragraph asks Docs to honor no extra
+      // spacing — the recompile then renders into a tight
+      // paragraph and the matrix sits flush with the surrounding
+      // line.
+      html = `<meta charset="utf-8"><p style="margin:0;padding:0;line-height:1;">${escapeHTML(text)}</p>`;
       LOG("decompiling:", JSON.stringify(src), "→", JSON.stringify(text));
     } else {
       const rendered = renderRich(region.rich, region.sourcePt);
@@ -3332,6 +5119,48 @@
       (t, i, arr) => t && arr.indexOf(t) === i
     );
     LOG("paste targets:", targets.map((t) => t.tagName || "(?)"));
+
+    // For decompile regions on tables, dispatch a Delete keypress
+    // before the paste — explicitly mirrors the user's manual
+    // gesture: double-click on one edge, drag to the other, press
+    // Delete. With the drag-selection covering the table block,
+    // Delete removes it structurally; paste then inserts the LaTeX
+    // text at the resulting cursor position. Paste alone over a
+    // multi-cell selection only replaces cell content and leaves
+    // the wrapper standing, so without Delete the table chrome
+    // never goes away.
+    const decompileTable = region.type === "decompile" &&
+      /\\begin\{|\\binom\{|\\frac\{|\\sqrt\{/.test(region.text || "");
+    if (decompileTable) {
+      const sendKeyAll = (key, code, keyCode) => {
+        for (const target of targets) {
+          for (const evType of ["keydown", "keypress", "keyup"]) {
+            const evt = new KeyboardEvent(evType, {
+              key, code, keyCode, which: keyCode,
+              bubbles: true, cancelable: true, composed: true,
+              view: window,
+            });
+            target.dispatchEvent(evt);
+          }
+        }
+        // Also dispatch input event with deleteContent inputType so
+        // input-event-driven editors (Docs included) see a clear
+        // delete signal even if their click handlers ignored the
+        // synthetic key path.
+        for (const target of targets) {
+          target.dispatchEvent(new InputEvent("beforeinput", {
+            inputType: "deleteContentBackward",
+            bubbles: true, cancelable: true, composed: true,
+          }));
+          target.dispatchEvent(new InputEvent("input", {
+            inputType: "deleteContentBackward",
+            bubbles: true, cancelable: true, composed: true,
+          }));
+        }
+      };
+      sendKeyAll("Backspace", "Backspace", 8);
+      await sleep(40);
+    }
 
     let anyOk = false;
     for (const target of targets) {

@@ -214,17 +214,105 @@
     return -1;
   }
 
+  // √( … ) folds via paren matching. Bare √x (no parens) — produced
+  // when the canvas reads back the compiler's [√ | radicand] HTML
+  // table as two adjacent glyphs — folds the next single Unicode
+  // codepoint or {…} group as the radicand. A multi-char alphanum
+  // run is also captured greedily so √x²+1 yields \sqrt{x²+1}; this
+  // matches the compiler's HTML rendering where the entire radicand
+  // sits in one cell under the vinculum.
   function convertSqrt(s) {
     let out = "";
     let i = 0;
     while (i < s.length) {
-      if (s[i] === "√" && s[i + 1] === "(") {
-        const end = findMatchingParen(s, i + 1);
-        if (end > 0) {
-          const inner = s.substring(i + 2, end);
-          out += "\\sqrt{" + convertSqrt(inner) + "}";
-          i = end + 1;
-          continue;
+      if (s[i] === "√") {
+        let j = i + 1;
+        while (j < s.length && s[j] === " ") j++;
+        if (s[j] === "(") {
+          const end = findMatchingParen(s, j);
+          if (end > 0) {
+            const inner = s.substring(j + 1, end);
+            out += "\\sqrt{" + convertSqrt(inner) + "}";
+            i = end + 1;
+            continue;
+          }
+        } else if (s[j] === "{") {
+          let depth = 1;
+          let k = j + 1;
+          while (k < s.length && depth > 0) {
+            if (s[k] === "\\") { k += 2; continue; }
+            if (s[k] === "{") depth++;
+            else if (s[k] === "}") depth--;
+            if (depth > 0) k++;
+          }
+          if (depth === 0) {
+            const inner = s.substring(j + 1, k);
+            out += "\\sqrt{" + convertSqrt(inner) + "}";
+            i = k + 1;
+            continue;
+          }
+        } else if (j < s.length && !/\s/.test(s[j])) {
+          // Greedy: consume an alphanum/script run as the radicand.
+          // Matches what the compiler produces — the full radicand
+          // sits in one cell — without overrunning into following
+          // operators (= + − etc.) or punctuation.
+          const RAD_CHAR = /[\p{L}\p{N}̀-ͯ⁰-₟₀-ₜ]/u;
+          let k = j;
+          // Always take at least one codepoint, then keep going as
+          // long as we're inside an alphanum/scripted run.
+          const cps = Array.from(s.substring(j));
+          if (cps.length) {
+            let consumed = cps[0].length;
+            for (let m = 1; m < cps.length; m++) {
+              if (!RAD_CHAR.test(cps[m])) break;
+              consumed += cps[m].length;
+            }
+            const inner = s.substring(j, j + consumed);
+            out += "\\sqrt{" + convertSqrt(inner) + "}";
+            i = j + consumed;
+            continue;
+          }
+        }
+      }
+      out += s[i];
+      i++;
+    }
+    return out;
+  }
+
+  // C(n,k) → \binom{n}{k}. Mirrors the compiler's plain-text fallback
+  // for \binom{n}{k} (`expandBinom` emits "C(n,k)" when no HTML cell
+  // structure is in play). The leading `C` only matches when it isn't
+  // itself part of a longer identifier ("ABC(x,y)" stays a function
+  // call) and the comma split is at top-level paren depth so nested
+  // parens in either argument survive.
+  function convertBinom(s) {
+    let out = "";
+    let i = 0;
+    while (i < s.length) {
+      if (s[i] === "C" && (i === 0 || !/[a-zA-Z\\]/.test(s[i - 1]))) {
+        let j = i + 1;
+        while (j < s.length && s[j] === " ") j++;
+        if (s[j] === "(") {
+          const end = findMatchingParen(s, j);
+          if (end > 0) {
+            const inner = s.substring(j + 1, end);
+            let depth = 0, splitIdx = -1;
+            for (let k = 0; k < inner.length; k++) {
+              const ch = inner[k];
+              if (ch === "(") depth++;
+              else if (ch === ")") depth--;
+              else if (ch === "," && depth === 0) { splitIdx = k; break; }
+            }
+            if (splitIdx >= 0) {
+              const num = inner.substring(0, splitIdx).trim();
+              const den = inner.substring(splitIdx + 1).trim();
+              out += "\\binom{" + convertBinom(num) +
+                     "}{" + convertBinom(den) + "}";
+              i = end + 1;
+              continue;
+            }
+          }
         }
       }
       out += s[i];
@@ -321,6 +409,12 @@
     s = convertAccents(s);
     s = convertMathbb(s);
     s = convertSqrt(s);
+    // convertBinom must run before convertFrac. Both consume `(...)`
+    // groups, but `C(n,k)` doesn't contain `/` so the frac scanner
+    // skips it on its own — the order matters only because we want
+    // the binom name to win over any future numeric-context paren
+    // rewriting. (Frac still scans for `(...)/(...)` after.)
+    s = convertBinom(s);
     s = convertFrac(s);
     s = convertScripts(s);
     s = convertSymbols(s);
