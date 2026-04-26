@@ -156,6 +156,9 @@
   // text sits next to a fraction bar / open space, not a bracket edge.
   const MATRIX_TEXT_SIBLING_PAD_EM = 0.2;
   const TEXT_SIDE_PAD_EM = 0.15 + CELL_SAFETY_EM;
+  const SQRT_GLYPH_SCALE = 1.4;
+  const SQRT_MATRIX_GLYPH_SCALE = 1.25;
+  const SQRT_GLYPH_EXTRA_PX = 1;
   // Text cells in any sequence builder are measured to their exact
   // rendered width — no side slack. Keeps text flush against adjacent
   // structural blocks (matrix bracket, fraction bar, cases brace) and
@@ -169,8 +172,15 @@
   // keeps Docs' actual layout in lockstep with our predicted widths.
   const CELL_FONT_FAMILY = "Arial,sans-serif";
 
-  // Rendered math renders at the same size as the surrounding text.
+  // Rendered math follows the surrounding text at normal sizes, then
+  // grows gently and caps out. Docs' table/glyph layout does not scale
+  // like a real math engine: parens, braces, row heights, and nested
+  // structures start looking cartoonish when every multiplier follows
+  // a large paragraph font linearly.
   const SIZE_FACTOR = 1.0;
+  const BASE_RENDER_PT = 11;
+  const MAX_RENDER_PT = 14;
+  const LARGE_RENDER_SLOPE = 0.35;
 
   // When Debug is on in the popup, every cell we emit draws a dashed
   // outline so we can see what Docs' paste importer actually keeps
@@ -200,7 +210,12 @@
   }
 
   function resolveRenderPt(sourcePt) {
-    return Math.max(4, (sourcePt || 11) * SIZE_FACTOR);
+    const rawPt = Math.max(4, (sourcePt || BASE_RENDER_PT) * SIZE_FACTOR);
+    if (rawPt <= BASE_RENDER_PT) return rawPt;
+    return Math.min(
+      MAX_RENDER_PT,
+      BASE_RENDER_PT + (rawPt - BASE_RENDER_PT) * LARGE_RENDER_SLOPE
+    );
   }
 
   // Cell width calculation, one place for everyone.
@@ -343,30 +358,39 @@
   // structural }`:
   //   - `structural === false`: cell is pure text; `html` is a string
   //     of valueHTML parts and the outer cell can wrap it in richPara.
-  //   - `structural === true`: cell has at least one \frac or \binom;
-  //     `html` is a complete <table> — a flat 2-row mini-grid where
-  //     text parts span both rows and fraction/choose parts split into
-  //     top/bottom halves. The outer cell must emit this html directly,
-  //     not wrapped in richPara/<span> (invalid to put <table> inside
-  //     <span>).
-  function buildCellInner(parts, pt) {
+  //   - `structural === true`: cell has a sqrt, \frac, or \binom;
+  //     `html` is structural markup that the outer cell must emit
+  //     directly, not wrapped in richPara/<span> (invalid to put
+  //     <table> inside <span>).
+  function buildCellInner(parts, pt, opts) {
     if (!parts || !parts.length) {
       return { html: "", width: 0, structural: false };
     }
-    // Single-sqrt fast path: emit the radical's own table directly so
+    // Single-sqrt fast path: keep the radical as structural markup so
     // `\sqrt{x}` as a matrix cell or as a sibling of a matrix renders
-    // with a vinculum instead of degrading to the text form `√(x)`. The
-    // 2-row outer wrapper below is shaped for fraction/choose layouts
-    // and would just nest the sqrt table redundantly.
+    // with a vinculum instead of degrading to the text form `√(x)`.
+    // Matrix callers can request flatSqrt metadata to splice the
+    // radical's two cells directly into the matrix row, avoiding Docs'
+    // extra nested-table top/bottom padding.
     if (parts.length === 1 && parts[0].kind === "sqrt") {
       const part = parts[0];
-      const sqrtInner = buildSqrtInnerHTML(
-        part.contentHTML || part.content || "",
-        pt
+      const contentHTML = part.contentHTML || part.content || "";
+      const layout = sqrtLayout(
+        contentHTML,
+        pt,
+        opts && opts.sqrtGlyphScale
       );
-      const m = /<table\s+width="(\d+)"/.exec(sqrtInner);
-      const w = m ? parseInt(m[1], 10) : 0;
-      return { html: sqrtInner, width: w, structural: true };
+      const sqrtInner = buildSqrtInnerHTML(
+        contentHTML,
+        pt,
+        opts && opts.sqrtGlyphScale
+      );
+      return {
+        html: sqrtInner,
+        width: layout.totalW,
+        structural: true,
+        flatSqrt: opts && opts.flattenSqrt ? layout : null,
+      };
     }
     const hasStructure = parts.some(
       (p) => p.kind === "fraction" || p.kind === "choose"
@@ -541,7 +565,12 @@
       for (let c = 0; c < cols; c++) {
         const parts = cellParts(r, c);
         if (parts) {
-          row.push(buildCellInner(parts, pt));
+          row.push(
+            buildCellInner(parts, pt, {
+              flattenSqrt: true,
+              sqrtGlyphScale: SQRT_MATRIX_GLYPH_SCALE,
+            })
+          );
         } else {
           row.push({ html: cellHTML(r, c), width: richMeasure(cellPlain(r, c)), structural: false });
         }
@@ -549,17 +578,34 @@
       cellInner.push(row);
     }
 
-    const columnWidths = [];
+    const columnSpecs = [];
     for (let c = 0; c < cols; c++) {
       let maxW = 0;
+      let glyphW = 0;
+      let contentW = 0;
+      let hasFlatSqrt = false;
       for (let r = 0; r < rowCount; r++) {
         const inner = cellInner[r][c];
+        if (inner.flatSqrt) {
+          hasFlatSqrt = true;
+          glyphW = Math.max(glyphW, inner.flatSqrt.glyphW);
+          contentW = Math.max(contentW, inner.flatSqrt.contentW);
+        }
         const w = inner.structural
           ? inner.width
           : cellWidthPx(inner.width, pt, MATRIX_SIDE_PAD_EM);
         maxW = Math.max(maxW, w);
       }
-      columnWidths.push(maxW);
+      if (hasFlatSqrt) {
+        const splitW = glyphW + contentW;
+        const totalW = Math.max(maxW, splitW);
+        columnSpecs.push({
+          widths: [glyphW, contentW + Math.max(0, totalW - splitW)],
+          totalW,
+        });
+      } else {
+        columnSpecs.push({ widths: [maxW], totalW: maxW });
+      }
     }
 
     const matrixCellStyle = mathCellStyle(pt, "#fa0");
@@ -599,11 +645,20 @@
       }
       for (let c = 0; c < cols; c++) {
         const inner = cellInner[r][c];
-        const content = inner.structural ? inner.html : richPara(pt, inner.html);
-        tds.push(
-          `<td width="${columnWidths[c]}" style="${matrixCellStyle}">` +
-          content + `</td>`
-        );
+        const spec = columnSpecs[c];
+        if (inner.flatSqrt && spec.widths.length === 2) {
+          tds.push(...flatSqrtTDs(inner.flatSqrt, spec.widths));
+        } else {
+          const content = inner.structural
+            ? inner.html
+            : richPara(pt, inner.html);
+          const colspan =
+            spec.widths.length > 1 ? ` colspan="${spec.widths.length}"` : "";
+          tds.push(
+            `<td${colspan} width="${spec.totalW}" style="${matrixCellStyle}">` +
+            content + `</td>`
+          );
+        }
       }
       if (bracketed) {
         tds.push(
@@ -623,7 +678,7 @@
     // Everywhere else the inner tables have no outer border, so this
     // +2 is matrix-only. Without it, the right bracket gets clipped.
     const totalW =
-      columnWidths.reduce((a, b) => a + b, 0) +
+      columnSpecs.reduce((a, b) => a + b.totalW, 0) +
       (bracketed ? BRACKET_CELL_W * 2 : 0) +
       (bracketed ? 2 : 0);
 
@@ -1041,8 +1096,8 @@
       return buildNestedSequenceHTML(parts, sourcePt);
     }
 
-    const textPt = sourcePt || 11;
     const mathPt = resolveRenderPt(sourcePt);
+    const textPt = mathPt;
 
     let hasStructure = false;
     const topCells = [];
@@ -1172,7 +1227,7 @@
     if (!cols) return null;
 
     const mathPt = resolveRenderPt(sourcePt);
-    const textPt = sourcePt || 11;
+    const textPt = mathPt;
 
     const useHTML =
       Array.isArray(matrix.rowsHTML) && matrix.rowsHTML.length === rowCount;
@@ -1197,7 +1252,12 @@
       for (let c = 0; c < cols; c++) {
         const cp = cellPartsAt(r, c);
         if (cp) {
-          row.push(buildCellInner(cp, mathPt));
+          row.push(
+            buildCellInner(cp, mathPt, {
+              flattenSqrt: true,
+              sqrtGlyphScale: SQRT_MATRIX_GLYPH_SCALE,
+            })
+          );
         } else {
           setRichFont(mathPt);
           row.push({
@@ -1210,17 +1270,34 @@
       cellInner.push(row);
     }
 
-    const columnWidths = [];
+    const columnSpecs = [];
     for (let c = 0; c < cols; c++) {
       let maxW = 0;
+      let glyphW = 0;
+      let contentW = 0;
+      let hasFlatSqrt = false;
       for (let r = 0; r < rowCount; r++) {
         const inner = cellInner[r][c];
+        if (inner.flatSqrt) {
+          hasFlatSqrt = true;
+          glyphW = Math.max(glyphW, inner.flatSqrt.glyphW);
+          contentW = Math.max(contentW, inner.flatSqrt.contentW);
+        }
         const w = inner.structural
           ? inner.width
           : cellWidthPx(inner.width, mathPt, MATRIX_SIDE_PAD_EM);
         maxW = Math.max(maxW, w);
       }
-      columnWidths.push(maxW);
+      if (hasFlatSqrt) {
+        const splitW = glyphW + contentW;
+        const totalW = Math.max(maxW, splitW);
+        columnSpecs.push({
+          widths: [glyphW, contentW + Math.max(0, totalW - splitW)],
+          totalW,
+        });
+      } else {
+        columnSpecs.push({ widths: [maxW], totalW: maxW });
+      }
     }
 
     const bracketed = matrix.style !== "plain";
@@ -1271,13 +1348,20 @@
           }
           for (let c = 0; c < cols; c++) {
             const inner = cellInner[r][c];
-            const content = inner.structural
-              ? inner.html
-              : richPara(mathPt, inner.html);
-            rowsCells[r].push(
-              `<td width="${columnWidths[c]}" style="${matrixCellStyle}">` +
-              content + `</td>`
-            );
+            const spec = columnSpecs[c];
+            if (inner.flatSqrt && spec.widths.length === 2) {
+              rowsCells[r].push(...flatSqrtTDs(inner.flatSqrt, spec.widths));
+            } else {
+              const content = inner.structural
+                ? inner.html
+                : richPara(mathPt, inner.html);
+              const colspan =
+                spec.widths.length > 1 ? ` colspan="${spec.widths.length}"` : "";
+              rowsCells[r].push(
+                `<td${colspan} width="${spec.totalW}" style="${matrixCellStyle}">` +
+                content + `</td>`
+              );
+            }
           }
           if (bracketed) {
             rowsCells[r].push(
@@ -1287,7 +1371,7 @@
           }
         }
         totalW +=
-          columnWidths.reduce((a, b) => a + b, 0) +
+          columnSpecs.reduce((a, b) => a + b.totalW, 0) +
           (bracketed ? BRACKET_CELL_W * 2 : 0);
       } else if (
         part.kind === "fraction" ||
@@ -1361,7 +1445,7 @@
     }
 
     const mathPt = resolveRenderPt(sourcePt);
-    const textPt = sourcePt || 11;
+    const textPt = mathPt;
 
     const useHTML =
       Array.isArray(cases.rowsHTML) && cases.rowsHTML.length === rowCount;
@@ -1543,39 +1627,9 @@
   // expect above a radical's body — while connecting seamlessly to
   // the √ glyph's top-right corner.
   function buildSqrtInnerHTML(contentHTML, pt, glyphScale) {
-    const sqrtPt = Math.max(4, pt * (glyphScale || 1.4));
-    setRichFont(pt);
-    const contentPx = richMeasure(stripHTMLTags(contentHTML));
-    const contentW = cellWidthPx(contentPx, pt, FRAC_SIDE_PAD_EM) + 1;
-    setRichFont(sqrtPt);
-    const glyphW = cellWidthPx(richMeasure("√"), sqrtPt, 0);
-    const totalW = glyphW + contentW;
-    // Modeled on buildMatrixHTML's bracket cells, which draw `[` / `]`
-    // via cell borders at the table edge. Key detail: don't call
-    // dbg() here — dbg() emits `border:0;` in non-debug mode, and a
-    // border shorthand AFTER a longhand wipes the longhand (CSS
-    // cascade: later declaration wins). That was silently killing
-    // the vinculum every attempt. Matrix bracket cells sidestep this
-    // by simply not calling dbg() at all.
-    // Vinculum only on the radicand cell, not on the √ glyph cell —
-    // the horizontal bar should start at the √'s top-right and extend
-    // over the radicand, not continue across the glyph itself.
-    // 0.75pt matches the fraction bar's stroke weight.
-    const VINCULUM = "0.75pt solid #000";
-    const glyphStyle =
-      `padding:0 !important;` +
-      `border:0;` +
-      `line-height:1;white-space:nowrap;` +
-      `text-align:center;vertical-align:middle;` +
-      `font-family:${CELL_FONT_FAMILY};` +
-      `font-size:${sqrtPt}pt;font-weight:normal;`;
-    const radStyle =
-      `padding:0 !important;` +
-      `border-top:${VINCULUM};border-left:0;border-right:0;border-bottom:0;` +
-      `line-height:1;white-space:nowrap;` +
-      `text-align:center;vertical-align:middle;` +
-      `font-family:${CELL_FONT_FAMILY};` +
-      `font-size:${pt}pt;font-weight:normal;`;
+    const layout = sqrtLayout(contentHTML, pt, glyphScale);
+    const { sqrtPt, contentW, glyphW, totalW } = layout;
+    const { glyphStyle, radStyle } = sqrtCellStyles(layout);
     return (
       `<table width="${totalW}" style="border-collapse:collapse;` +
       `width:${totalW}px;">` +
@@ -1590,6 +1644,68 @@
     );
   }
 
+  function sqrtLayout(contentHTML, pt, glyphScale) {
+    const sqrtPt = Math.max(4, pt * (glyphScale || SQRT_GLYPH_SCALE));
+    setRichFont(pt);
+    const contentPx = richMeasure(stripHTMLTags(contentHTML));
+    const contentW = cellWidthPx(contentPx, pt, FRAC_SIDE_PAD_EM) + 1;
+    setRichFont(sqrtPt);
+    const glyphW = cellWidthPx(richMeasure("√"), sqrtPt, 0) + SQRT_GLYPH_EXTRA_PX;
+    const totalW = glyphW + contentW;
+    return { contentHTML, pt, sqrtPt, contentW, glyphW, totalW };
+  }
+
+  function sqrtCellStyles(layout, glyphAlign, glyphRightPadPx) {
+    const { pt, sqrtPt } = layout;
+    const glyphPadding = glyphRightPadPx
+      ? `padding:0 ${glyphRightPadPx}px 0 0 !important;`
+      : `padding:0 !important;`;
+    // Modeled on buildMatrixHTML's bracket cells, which draw `[` / `]`
+    // via cell borders at the table edge. Key detail: don't call
+    // dbg() here — dbg() emits `border:0;` in non-debug mode, and a
+    // border shorthand AFTER a longhand wipes the longhand (CSS
+    // cascade: later declaration wins). That was silently killing
+    // the vinculum every attempt. Matrix bracket cells sidestep this
+    // by simply not calling dbg() at all.
+    // Vinculum only on the radicand cell, not on the √ glyph cell —
+    // the horizontal bar should start at the √'s top-right and extend
+    // over the radicand, not continue across the glyph itself.
+    // 0.75pt matches the fraction bar's stroke weight.
+    const VINCULUM = "0.75pt solid #000";
+    const glyphStyle =
+      glyphPadding +
+      `border:0;` +
+      `line-height:1;white-space:nowrap;` +
+      `text-align:${glyphAlign || "center"};vertical-align:middle;` +
+      `font-family:${CELL_FONT_FAMILY};` +
+      `font-size:${sqrtPt}pt;font-weight:normal;`;
+    const radStyle =
+      `padding:0 !important;` +
+      `border-top:${VINCULUM};border-left:0;border-right:0;border-bottom:0;` +
+      `line-height:1;white-space:nowrap;` +
+      `text-align:center;vertical-align:middle;` +
+      `font-family:${CELL_FONT_FAMILY};` +
+      `font-size:${pt}pt;font-weight:normal;`;
+    return { glyphStyle, radStyle };
+  }
+
+  function flatSqrtTDs(layout, widths) {
+    const { contentHTML, pt, sqrtPt } = layout;
+    const { glyphStyle, radStyle } = sqrtCellStyles(
+      layout,
+      "right",
+      SQRT_GLYPH_EXTRA_PX
+    );
+    return [
+      `<td valign="middle" align="right" width="${widths[0]}" height="1" ` +
+        `style="${glyphStyle}">` +
+        `<span style="font-size:${sqrtPt}pt;line-height:1;">√</span></td>`,
+      `<td valign="middle" align="center" width="${widths[1]}" height="1" ` +
+        `style="${radStyle}">` +
+        `<span style="font-size:${pt}pt;line-height:1;">${contentHTML}</span></td>`,
+    ];
+  }
+
   // Nested fallback for sequences the flat builders can't handle —
   // typically 2+ structural blocks with differing row counts (cases +
   // bmatrix, bmatrix + bmatrix, etc). Renders each part as its own
@@ -1600,7 +1716,7 @@
   // impossible.
   function buildNestedSequenceHTML(parts, sourcePt) {
     const mathPt = resolveRenderPt(sourcePt);
-    const textPt = sourcePt || 11;
+    const textPt = mathPt;
 
     // buildMatrixHTML / buildCasesHTML / buildChooseHTML embed the
     // total table width as the first attribute — pluck it back out
@@ -2839,10 +2955,12 @@
       }
     };
 
-    // Sqrt structural detection. The compiler renders \sqrt{x} as a
-    // 1-row table [√ glyph (1.4× pt) | radicand cell (pt) with
-    // border-top vinculum]; canvas reads √ and the radicand as
-    // separate fragments at similar y. The textual decompiler can
+    // Sqrt structural detection. The compiler renders \sqrt{x} as
+    // adjacent √ and radicand cells (normally a 1-row table; matrix
+    // cells splice them directly into the matrix row), with the
+    // radicand cell carrying the border-top vinculum. Canvas reads √
+    // and the radicand as separate fragments at similar y. The textual
+    // decompiler can
     // only undo the `√(x)` parens form, so without folding here a
     // bare "√x" leaks through as `\sqrt{x}` (now via the bare-form
     // fallback in decompiler.js) but multi-glyph radicands (`x²+1`,
