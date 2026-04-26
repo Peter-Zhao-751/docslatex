@@ -1903,8 +1903,8 @@
         // borders render at full thickness. Cases keep natural
         // centering — brace-on-left already provides the visual offset
         // a bracketed matrix lacks.
-        const MATRIX_LEFT_SHIFT = b.isMatrix ? 2 : 0;
-        const MATRIX_RIGHT_SHIFT = b.isMatrix ? 5 : 0;
+        const MATRIX_LEFT_SHIFT = b.isMatrix ? 2.5 : 0;
+        const MATRIX_RIGHT_SHIFT = b.isMatrix ? 5.5 : 0;
         totalW += b.w + MATRIX_LEFT_SHIFT + MATRIX_RIGHT_SHIFT;
         const padStyle =
           `padding:${tp}px ${MATRIX_RIGHT_SHIFT}px ${bp}px ` +
@@ -4278,27 +4278,48 @@
     }
     const annotations = annoParts;
 
-    // Math regions: \[ ... \] and \( ... \). Non-greedy pairs the
-    // earliest closer with each opener, and the alternation prevents
-    // mismatched pairs like \( ... \].
-    const mathRe = /\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)/g;
+    // Math regions: \[ ... \] and \( ... \). Strict 1:1 — the lookahead
+    // forbids another \[ or \( inside the body, so a stray \] far from
+    // the opener can't be paired across an intervening \(...\). Without
+    // this, one missing \] swallows every later equation into a single
+    // giant region, and caret-touch dark-paint then lights all of them
+    // up at once.
+    const mathRe =
+      /\\\[(?:(?!\\\[|\\\()[\s\S])*?\\\]|\\\((?:(?!\\\[|\\\()[\s\S])*?\\\)/g;
     const mathRanges = [];
     let mm;
     while ((mm = mathRe.exec(concat)) !== null) {
       mathRanges.push([mm.index, mm.index + mm[0].length]);
     }
 
-    // Unclosed delimiter: mask out matched math regions, then find the
-    // first remaining \[ or \( — everything from it to end is unclosed.
+    // Unclosed openers: mask matched regions with NUL so the masked
+    // chars can't form opener tokens, then any remaining \[ or \( is
+    // unmatched. Each unclosed range stops at the next masked char
+    // (start of a valid match) or the next unclosed opener — extending
+    // to end-of-doc would overlap the next valid green region and stack
+    // a yellow underline on top of it.
     const maskedArr = concat.split("");
     for (const [ra, rb] of mathRanges) {
-      for (let i = ra; i < rb; i++) maskedArr[i] = " ";
+      for (let i = ra; i < rb; i++) maskedArr[i] = "\0";
     }
     const masked = maskedArr.join("");
     const unclosedRanges = [];
-    const openerMatch = /\\\[|\\\(/.exec(masked);
-    if (openerMatch) {
-      unclosedRanges.push([openerMatch.index, concat.length]);
+    const openerRe = /\\\[|\\\(/g;
+    const openerStarts = [];
+    let om;
+    while ((om = openerRe.exec(masked)) !== null) {
+      openerStarts.push(om.index);
+    }
+    for (let i = 0; i < openerStarts.length; i++) {
+      const start = openerStarts[i];
+      let endPos = concat.length;
+      if (i + 1 < openerStarts.length) {
+        endPos = Math.min(endPos, openerStarts[i + 1]);
+      }
+      for (let k = start + 2; k < masked.length; k++) {
+        if (masked.charCodeAt(k) === 0) { endPos = Math.min(endPos, k); break; }
+      }
+      unclosedRanges.push([start, endPos]);
     }
 
     const isCovered = (a, b) => {
@@ -5129,7 +5150,8 @@
     return !evt.defaultPrevented;
   }
 
-  async function selectRegionOnCanvas(region) {
+  async function selectRegionOnCanvas(region, opts) {
+    const skipCollapse = !!(opts && opts.skipCollapse);
     const canvas = region.canvas;
     if (!canvas || !canvas.isConnected) { LOG("region canvas missing"); return false; }
     const rects = region.viewportRects || [];
@@ -5253,11 +5275,16 @@
       // replace only their partial highlight. The 550ms sleep keeps
       // the drag-start from being coalesced into a double-click,
       // which would select by word instead of by character.
-      send("pointerdown", x1, y1, 1, 1);
-      send("mousedown",   x1, y1, 1, 1);
-      send("pointerup",   x1, y1, 0, 1);
-      send("mouseup",     x1, y1, 0, 1);
-      await sleep(550);
+      // Autocompile passes skipCollapse: the trigger requires a
+      // collapsed caret at the region's end, so there's nothing to
+      // collapse and no double-click risk.
+      if (!skipCollapse) {
+        send("pointerdown", x1, y1, 1, 1);
+        send("mousedown",   x1, y1, 1, 1);
+        send("pointerup",   x1, y1, 0, 1);
+        send("mouseup",     x1, y1, 0, 1);
+        await sleep(550);
+      }
 
       send("pointerdown", x1, y1, 1, 1);
       send("mousedown",   x1, y1, 1, 1);
@@ -5277,12 +5304,12 @@
     return true;
   }
 
-  async function replaceInDoc(region) {
+  async function replaceInDoc(region, opts) {
     // Select the target on the canvas so the forthcoming paste replaces
     // it instead of inserting alongside it. Same mechanism for compile
     // (select the \(...\) source) and decompile (select the Unicode math
     // run).
-    await selectRegionOnCanvas(region);
+    await selectRegionOnCanvas(region, opts);
 
     const iframe = findDocsIframe();
     if (!iframe) {
@@ -5344,6 +5371,78 @@
     );
     LOG("paste targets:", targets.map((t) => t.tagName || "(?)"));
 
+    // Capture iframe selection state — if the source is correctly selected,
+    // sel.toString() should equal the LaTeX source for compile or the unicode
+    // run for decompile. An empty selection means the click+drag missed and
+    // paste will land at whatever the cursor's collapsed position is.
+    try {
+      const win = iframe.contentWindow;
+      const sel = win && win.getSelection ? win.getSelection() : null;
+      if (sel) {
+        const selText = sel.toString();
+        const ancestorTag =
+          sel.rangeCount > 0
+            ? (sel.getRangeAt(0).commonAncestorContainer.nodeType === 1
+                ? sel.getRangeAt(0).commonAncestorContainer.tagName
+                : sel.getRangeAt(0).commonAncestorContainer.parentNode &&
+                    sel.getRangeAt(0).commonAncestorContainer.parentNode.tagName)
+            : "(no range)";
+        let cellAncestor = null;
+        if (sel.rangeCount > 0) {
+          let n = sel.getRangeAt(0).commonAncestorContainer;
+          if (n && n.nodeType !== 1) n = n.parentNode;
+          while (n && n !== body) {
+            if (n.tagName === "TD" || n.tagName === "TH" ||
+                n.tagName === "TABLE") {
+              cellAncestor = n.tagName;
+              break;
+            }
+            n = n.parentNode;
+          }
+        }
+        LOG(
+          "selection before paste — text:",
+          JSON.stringify(selText.slice(0, 200)),
+          "len:", selText.length,
+          "collapsed:", sel.isCollapsed,
+          "ancestor:", ancestorTag,
+          "in-table?", cellAncestor || "no"
+        );
+      } else {
+        LOG("selection before paste: no selection object");
+      }
+    } catch (err) {
+      LOG("selection-state probe threw:", err);
+    }
+
+    const sendKeyAll = (key, code, keyCode, inputType) => {
+      for (const target of targets) {
+        for (const evType of ["keydown", "keypress", "keyup"]) {
+          const evt = new KeyboardEvent(evType, {
+            key, code, keyCode, which: keyCode,
+            bubbles: true, cancelable: true, composed: true,
+            view: window,
+          });
+          target.dispatchEvent(evt);
+        }
+      }
+      // Mirror the keystroke as a beforeinput/input pair — Docs
+      // (and other input-event-driven editors) listen on input
+      // events and may ignore synthetic KeyboardEvents alone.
+      if (inputType) {
+        for (const target of targets) {
+          target.dispatchEvent(new InputEvent("beforeinput", {
+            inputType,
+            bubbles: true, cancelable: true, composed: true,
+          }));
+          target.dispatchEvent(new InputEvent("input", {
+            inputType,
+            bubbles: true, cancelable: true, composed: true,
+          }));
+        }
+      }
+    };
+
     // For decompile regions on tables, dispatch a Delete keypress
     // before the paste — explicitly mirrors the user's manual
     // gesture: double-click on one edge, drag to the other, press
@@ -5356,33 +5455,7 @@
     const decompileTable = region.type === "decompile" &&
       /\\begin\{|\\binom\{|\\frac\{|\\sqrt\{/.test(region.text || "");
     if (decompileTable) {
-      const sendKeyAll = (key, code, keyCode) => {
-        for (const target of targets) {
-          for (const evType of ["keydown", "keypress", "keyup"]) {
-            const evt = new KeyboardEvent(evType, {
-              key, code, keyCode, which: keyCode,
-              bubbles: true, cancelable: true, composed: true,
-              view: window,
-            });
-            target.dispatchEvent(evt);
-          }
-        }
-        // Also dispatch input event with deleteContent inputType so
-        // input-event-driven editors (Docs included) see a clear
-        // delete signal even if their click handlers ignored the
-        // synthetic key path.
-        for (const target of targets) {
-          target.dispatchEvent(new InputEvent("beforeinput", {
-            inputType: "deleteContentBackward",
-            bubbles: true, cancelable: true, composed: true,
-          }));
-          target.dispatchEvent(new InputEvent("input", {
-            inputType: "deleteContentBackward",
-            bubbles: true, cancelable: true, composed: true,
-          }));
-        }
-      };
-      sendKeyAll("Backspace", "Backspace", 8);
+      sendKeyAll("Backspace", "Backspace", 8, "deleteContentBackward");
       await sleep(40);
     }
 
@@ -5400,6 +5473,7 @@
       );
       anyOk = anyOk || pasteOk || inputOk;
     }
+
     return anyOk;
   }
 
@@ -5489,17 +5563,77 @@
   function updateCaretHighlight() {
     const match = regionAtCaret(findUserCaretRect());
     if (match === caretRegion) return;
-    const previous = caretRegion;
     if (caretRegion) paintRegion(caretRegion, false);
     caretRegion = match;
     if (match) paintRegion(match, true);
-    // Auto-compile on the "leaving" transition (dark → normal), but
-    // only if the previous region still exists — otherwise rebuild
-    // already dropped it, which isn't a user-initiated leave.
-    if (previous && previous !== match && autocompile &&
-        greenRegions.includes(previous)) {
-      triggerAutoCompile(previous);
+  }
+
+  function caretAtEndOfRegion(caretRect, region) {
+    if (!caretRect || !region) return false;
+    const rects = region.viewportRects || [];
+    if (!rects.length) return false;
+    // Multi-line equations (cases, matrices, display blocks) span several
+    // visual lines. "End of equation" means the rightmost edge of the
+    // bottom-most line, not the global rightmost rect (which is often on
+    // some internal wider line).
+    const LINE_SLOP = 6;
+    let maxBottom = -Infinity;
+    for (const r of rects) if (r.bottom > maxBottom) maxBottom = r.bottom;
+    let lineRight = -Infinity, lineTop = Infinity, lineBottom = -Infinity;
+    for (const r of rects) {
+      if (r.bottom < maxBottom - LINE_SLOP) continue;
+      if (r.right > lineRight) lineRight = r.right;
+      if (r.top < lineTop) lineTop = r.top;
+      if (r.bottom > lineBottom) lineBottom = r.bottom;
     }
+    if (lineRight === -Infinity) return false;
+    if (caretRect.bottom < lineTop - LINE_SLOP) return false;
+    if (caretRect.top > lineBottom + LINE_SLOP) return false;
+    return caretRect.left >= lineRight - CARET_TOUCH_SLOP;
+  }
+
+  function onAutoCompileKey(e) {
+    if (!enabled || !autocompile) return;
+    if (e.key !== "Enter" && e.key !== " " && e.key !== "Tab") return;
+    if (!caretRegion || !greenRegions.includes(caretRegion)) return;
+    const caretRect = findUserCaretRect();
+    if (!caretAtEndOfRegion(caretRect, caretRegion)) return;
+    // Defer until after the keystroke is processed by Docs — otherwise
+    // selectRegionOnCanvas moves the caret to the start of the equation
+    // before the space/enter/tab gets inserted, and the keystroke ends
+    // up landing at the front of the equation instead of after it.
+    const region = caretRegion;
+    setTimeout(() => {
+      if (greenRegions.includes(region)) triggerAutoCompile(region);
+    }, 0);
+  }
+
+  const autoCompileKeyTargets = new WeakSet();
+  let autoCompileKeyAttachedIframe = null;
+  function attachAutoCompileKey(target) {
+    if (!target || autoCompileKeyTargets.has(target)) return;
+    try {
+      target.addEventListener("keydown", onAutoCompileKey, true);
+      autoCompileKeyTargets.add(target);
+    } catch (_) {}
+  }
+  function ensureAutoCompileKeyListener() {
+    attachAutoCompileKey(document);
+    attachAutoCompileKey(window);
+    // Skip the iframe scan once we're attached and the iframe is still
+    // alive — running findDocsIframe every animation frame tanks Docs.
+    if (autoCompileKeyAttachedIframe &&
+        autoCompileKeyAttachedIframe.isConnected) return;
+    const iframe = findDocsIframe();
+    if (!iframe) return;
+    const doc = iframe.contentDocument;
+    if (doc) {
+      attachAutoCompileKey(doc);
+      if (doc.body) attachAutoCompileKey(doc.body);
+      if (doc.documentElement) attachAutoCompileKey(doc.documentElement);
+    }
+    try { attachAutoCompileKey(iframe.contentWindow); } catch (_) {}
+    autoCompileKeyAttachedIframe = iframe;
   }
 
   const AUTOCOMPILE_MIN_INTERVAL_MS = 1000;
@@ -5528,7 +5662,7 @@
     autoCompileLastRun = now;
     popupBusy = true;
     try {
-      const ok = await replaceInDoc(region);
+      const ok = await replaceInDoc(region, { skipCollapse: true });
       if (ok) compile();
     } catch (err) {
       LOG("auto-compile threw:", err);
@@ -5544,6 +5678,7 @@
       syncPositions();
       syncRegionViewportRects();
       updateCaretHighlight();
+      ensureAutoCompileKeyListener();
       if (hoveredRegion) repositionPopup();
     }
     requestAnimationFrame(tick);
