@@ -156,7 +156,7 @@
   // text sits next to a fraction bar / open space, not a bracket edge.
   const MATRIX_TEXT_SIBLING_PAD_EM = 0.2;
   const TEXT_SIDE_PAD_EM = 0.15 + CELL_SAFETY_EM;
-  const SQRT_GLYPH_SCALE = 1.4;
+  const SQRT_GLYPH_SCALE = 1.3;
   const SQRT_MATRIX_GLYPH_SCALE = 1.25;
   const SQRT_GLYPH_EXTRA_PX = 1;
   // Text cells in any sequence builder are measured to their exact
@@ -172,15 +172,20 @@
   // keeps Docs' actual layout in lockstep with our predicted widths.
   const CELL_FONT_FAMILY = "Arial,sans-serif";
 
-  // Rendered math follows the surrounding text at normal sizes, then
-  // grows gently and caps out. Docs' table/glyph layout does not scale
-  // like a real math engine: parens, braces, row heights, and nested
-  // structures start looking cartoonish when every multiplier follows
-  // a large paragraph font linearly.
+  // Rendered math follows the surrounding text up to whichever is
+  // smaller: the user's source font size, or the pt at which the
+  // equation just fills the available line. Static fallback cap (used
+  // when no canvas width is available to compute a fit-based cap)
+  // matches the legacy 14pt ceiling that kept Docs' table/glyph
+  // layout from looking cartoonish.
   const SIZE_FACTOR = 1.0;
   const BASE_RENDER_PT = 11;
   const MAX_RENDER_PT = 14;
-  const LARGE_RENDER_SLOPE = 0.35;
+  // Fraction of canvas.offsetWidth that's usable for inline content —
+  // page margins (typically ~12% per side on US Letter) eat the rest.
+  // Errs on the conservative side so equations don't overflow into the
+  // right margin.
+  const LINE_WIDTH_USABLE_FRACTION = 0.78;
 
   // When Debug is on in the popup, every cell we emit draws a dashed
   // outline so we can see what Docs' paste importer actually keeps
@@ -209,13 +214,26 @@
     );
   }
 
+  // Per-render upper bound on the rendered pt. renderRich sets this
+  // to min(sourcePt, fitCap) before invoking the build* functions, so
+  // structural pt grows with the user's text size up to the point
+  // where the equation would overflow the line. Defaults to
+  // MAX_RENDER_PT so nothing breaks if a build* runs outside a
+  // renderRich call.
+  let renderCap = MAX_RENDER_PT;
+
   function resolveRenderPt(sourcePt) {
     const rawPt = Math.max(4, (sourcePt || BASE_RENDER_PT) * SIZE_FACTOR);
-    if (rawPt <= BASE_RENDER_PT) return rawPt;
-    return Math.min(
-      MAX_RENDER_PT,
-      BASE_RENDER_PT + (rawPt - BASE_RENDER_PT) * LARGE_RENDER_SLOPE
-    );
+    const pt = Math.min(rawPt, renderCap);
+    // Docs' paste importer strips inline cell styles (white-space:nowrap,
+    // line-height, sometimes width) when the cell font-size matches the
+    // surrounding paragraph's default — typically 11pt. The stripped
+    // nowrap then lets narrow cells like a \binom numerator wrap
+    // mid-token. Empirically: 10 and 12 render fine, only 11 breaks,
+    // and Docs rounds anything in [11, 11.5) back to 11 — so 11.5 is
+    // the smallest safe bump. Visually a hair larger than body text
+    // but well below the next integer step.
+    return Math.abs(pt - 11) < 0.001 ? 11.5 : pt;
   }
 
   // Cell width calculation, one place for everyone.
@@ -717,15 +735,20 @@
         const valueHTML = part.valueHTML || part.value || "";
         if (!valueHTML) continue;
         setRichFont(pt);
+        // Tight right-slack for the cases results column: text-align:left
+        // means any width budget beyond the content shows up as visible
+        // empty space on the right of the cell. Drop the 0.15em visual
+        // breathing room and keep only CELL_SAFETY_EM for measurement
+        // undercount, so the cell hugs the text on the right.
         const w = cellWidthPx(
           richMeasure(stripHTMLTags(valueHTML)),
           pt,
-          TEXT_SIDE_PAD_EM
+          CELL_SAFETY_EM
         );
         totalW += w;
         const style =
           `padding:0 !important;border:none;white-space:nowrap;` +
-          `line-height:1.15;text-align:left;vertical-align:middle;` +
+          `line-height:1.05;text-align:left;vertical-align:middle;` +
           `font-family:${CELL_FONT_FAMILY};font-size:${pt}pt;` +
           `font-weight:normal;${dbg("#0cc")}`;
         topCells.push({
@@ -742,12 +765,12 @@
         const w = cellWidthPx(
           richMeasure(stripHTMLTags(v)),
           pt,
-          TEXT_SIDE_PAD_EM
+          CELL_SAFETY_EM
         );
         totalW += w;
         const style =
           `padding:0 !important;border:none;white-space:nowrap;` +
-          `line-height:1.15;text-align:left;vertical-align:middle;` +
+          `line-height:1.05;text-align:left;vertical-align:middle;` +
           `font-family:${CELL_FONT_FAMILY};font-size:${pt}pt;` +
           `font-weight:normal;${dbg("#0cc")}`;
         topCells.push({
@@ -948,7 +971,7 @@
     // paste importer strips cell padding on rowspan cells
     // unpredictably) or Unicode piece stacking (leaves visible seams
     // between cells).
-    const bracePt = Math.max(pt * 1.8, pt * totalOuterRows * 1.15);
+    const bracePt = Math.max(pt * 1.5, pt * totalOuterRows * 1.05);
     setRichFont(bracePt);
     const braceW = cellWidthPx(richMeasure("{"), bracePt, 0);
 
@@ -1752,12 +1775,13 @@
           mathPt
         );
         const w = parseW(inner);
-        // Single row at sqrtPt (= mathPt × 1.4, matching the default
-        // glyphScale in buildSqrtInnerHTML). The √ glyph sets the row
-        // height; the radicand centers inside it below the vinculum.
+        // Single row at sqrtPt (= mathPt × SQRT_GLYPH_SCALE, matching
+        // the default glyphScale in buildSqrtInnerHTML). The √ glyph
+        // sets the row height; the radicand centers inside it below
+        // the vinculum.
         built.push({
           kind: "sqrt",
-          inner, w, hPt: mathPt * 1.4,
+          inner, w, hPt: mathPt * SQRT_GLYPH_SCALE,
         });
       } else if (part.kind === "fraction") {
         const inner = buildFractionInnerHTML(
@@ -1808,9 +1832,9 @@
         if (isMatrix) {
           hPt = rows * mathPt;
         } else {
-          const rowsHeight = rows * mathPt * 1.15;
+          const rowsHeight = rows * mathPt * 1.05;
           // Mirrors the brace size in buildCasesHTML.
-          const bracePt = Math.max(mathPt * 1.8, mathPt * rows * 1.1);
+          const bracePt = Math.max(mathPt * 1.5, mathPt * rows * 1.05);
           hPt = Math.max(rowsHeight, bracePt);
         }
         built.push({
@@ -1853,8 +1877,8 @@
       } else if (b.kind === "sqrt") {
         totalW += b.w;
         // inner is a nested table now (strut-killed glyph row + vinculum
-        // + radicand) — strut-kill the wrapper cell too so the outer's
-        // text strut doesn't add extra vertical space around the sqrt.
+        // + radicand) — line-height:0 strut-kills the wrapper cell so
+        // the outer's text strut doesn't add extra vertical space.
         const style =
           `padding:${tp}px 0 ${bp}px 0 !important;border:none;line-height:0;` +
           `font-size:0;text-align:center;vertical-align:middle;${dbg("#0cc")}`;
@@ -1880,7 +1904,7 @@
         // centering — brace-on-left already provides the visual offset
         // a bracketed matrix lacks.
         const MATRIX_LEFT_SHIFT = b.isMatrix ? 2 : 0;
-        const MATRIX_RIGHT_SHIFT = b.isMatrix ? 2 : 0;
+        const MATRIX_RIGHT_SHIFT = b.isMatrix ? 5 : 0;
         totalW += b.w + MATRIX_LEFT_SHIFT + MATRIX_RIGHT_SHIFT;
         const padStyle =
           `padding:${tp}px ${MATRIX_RIGHT_SHIFT}px ${bp}px ` +
@@ -1904,7 +1928,8 @@
     // block. Same-total rule keeps every cell at its natural width.
     return (
       `<meta charset="utf-8">` +
-      `<table width="${totalW}" style="border-collapse:collapse;border:none;` +
+      `<table cellpadding="0" cellspacing="0" width="${totalW}" ` +
+      `style="margin:0;padding:0;border-collapse:collapse;border:none;` +
       `width:${totalW}px;">` +
       `<tr>${cells.join("")}</tr>` +
       `</table>`
@@ -1924,48 +1949,129 @@
     return "";
   }
 
+  // Estimate rendered equation width in CSS pixels at the given pt.
+  // Mirrors the width math in the build* functions — close enough to
+  // pick a cap at which the equation just fits the line. Errs slightly
+  // on the side of overestimating so we'd rather scale a hair too
+  // small than overflow.
+  function estimateRichWidthPx(rich, pt) {
+    if (!rich) return 0;
+    setRichFont(pt);
+    switch (rich.kind) {
+      case "text":
+        return richMeasure(stripHTMLTags(rich.valueHTML || rich.value || ""));
+      case "fraction": {
+        const n = richMeasure(stripHTMLTags(rich.numHTML || rich.num || ""));
+        const d = richMeasure(stripHTMLTags(rich.denHTML || rich.den || ""));
+        return cellWidthPx(Math.max(n, d), pt, FRAC_SIDE_PAD_EM);
+      }
+      case "choose": {
+        const n = richMeasure(stripHTMLTags(rich.numHTML || rich.num || ""));
+        const d = richMeasure(stripHTMLTags(rich.denHTML || rich.den || ""));
+        const inner = cellWidthPx(Math.max(n, d), pt, CHOOSE_SIDE_PAD_EM);
+        // Two paren cells, each ~0.5em wide at 1.9× pt.
+        const parenW = Math.ceil(pt * 1.9 * PT_TO_PX * 0.5);
+        return inner + 2 * parenW;
+      }
+      case "sqrt": {
+        const c = richMeasure(stripHTMLTags(rich.contentHTML || rich.content || ""));
+        const sqrtW =
+          Math.ceil(pt * SQRT_GLYPH_SCALE * PT_TO_PX * 0.6) +
+          SQRT_GLYPH_EXTRA_PX;
+        return sqrtW + cellWidthPx(c, pt, FRAC_SIDE_PAD_EM);
+      }
+      case "matrix": {
+        const rows = rich.rows || [];
+        if (!rows.length) return 0;
+        const cols = Math.max(...rows.map((r) => (r ? r.length : 0)));
+        let total = 0;
+        for (let c = 0; c < cols; c++) {
+          let maxW = 0;
+          for (const row of rows) {
+            const cell = (row && row[c]) || "";
+            const w = richMeasure(stripHTMLTags(cell));
+            if (w > maxW) maxW = w;
+          }
+          total += cellWidthPx(maxW, pt, MATRIX_SIDE_PAD_EM);
+        }
+        // Cases brace is wider than [/{/| brackets; pad accordingly.
+        const bracketSlack =
+          rich.style === "cases" ? Math.ceil(pt * PT_TO_PX) : 8;
+        return total + bracketSlack;
+      }
+      case "sequence":
+        return (rich.parts || []).reduce(
+          (sum, p) => sum + estimateRichWidthPx(p, pt),
+          0
+        );
+    }
+    return 0;
+  }
+
   // Given a rich compile result, produce the text/plain + text/html pair
   // the paste dispatcher needs. Plain text is always set so pastes into
   // non-Docs targets degrade gracefully.
-  function renderRich(rich, sourcePt) {
+  //
+  // `canvas` is the source Kix canvas the region was read from — its
+  // offsetWidth lets us cap the rendered pt at "max size before the
+  // equation overflows the line", so structural rendering can grow
+  // with the user's source font size when there's room and scale
+  // down when there isn't.
+  function renderRich(rich, sourcePt, canvas) {
     if (!rich) return { text: "", html: null };
+    const effPt = sourcePt || BASE_RENDER_PT;
+    const lineWidthPx =
+      canvas && canvas.offsetWidth
+        ? canvas.offsetWidth * LINE_WIDTH_USABLE_FRACTION
+        : 0;
+    const naturalW = estimateRichWidthPx(rich, effPt);
+    const fitCap =
+      lineWidthPx > 0 && naturalW > lineWidthPx
+        ? effPt * (lineWidthPx / naturalW)
+        : Infinity;
+    const prevCap = renderCap;
+    renderCap = Math.max(4, Math.min(effPt, fitCap));
     let html = null;
-    if (rich.kind === "fraction") {
-      html = buildFractionHTML(
-        rich.numHTML || rich.num,
-        rich.denHTML || rich.den,
-        sourcePt
-      );
-    } else if (rich.kind === "choose") {
-      html = buildChooseHTML(
-        rich.numHTML || rich.num,
-        rich.denHTML || rich.den,
-        sourcePt
-      );
-    } else if (rich.kind === "matrix") {
-      if (rich.style === "cases") {
-        html = buildCasesHTML(rich.rows, sourcePt, rich.rowsHTML, rich.rowsParts);
-      } else {
-        html = buildMatrixHTML(rich.rows, rich.style, sourcePt, rich.rowsHTML, rich.rowsParts);
+    try {
+      if (rich.kind === "fraction") {
+        html = buildFractionHTML(
+          rich.numHTML || rich.num,
+          rich.denHTML || rich.den,
+          sourcePt
+        );
+      } else if (rich.kind === "choose") {
+        html = buildChooseHTML(
+          rich.numHTML || rich.num,
+          rich.denHTML || rich.den,
+          sourcePt
+        );
+      } else if (rich.kind === "matrix") {
+        if (rich.style === "cases") {
+          html = buildCasesHTML(rich.rows, sourcePt, rich.rowsHTML, rich.rowsParts);
+        } else {
+          html = buildMatrixHTML(rich.rows, rich.style, sourcePt, rich.rowsHTML, rich.rowsParts);
+        }
+      } else if (rich.kind === "sqrt") {
+        const pt = resolveRenderPt(sourcePt);
+        html =
+          `<meta charset="utf-8">` +
+          buildSqrtInnerHTML(rich.contentHTML || rich.content || "", pt);
+      } else if (rich.kind === "sequence") {
+        html = buildSequenceHTML(rich.parts, sourcePt);
+      } else if (rich.kind === "text") {
+        // Pure text with no structural parts still needs an HTML
+        // version when the LaTeX had `_` or `^` — the HTML variant
+        // carries native <sub>/<sup> tags that Docs turns into real
+        // subscript/superscript formatting (Cmd+, / Cmd+.). Without
+        // this, the paste falls back to text/plain, which for
+        // unmappable args like `_{\delta}` shows as a literal "_δ".
+        const valueHTML = rich.valueHTML || "";
+        if (valueHTML && valueHTML.indexOf("<") >= 0) {
+          html = `<meta charset="utf-8">${valueHTML}`;
+        }
       }
-    } else if (rich.kind === "sqrt") {
-      const pt = resolveRenderPt(sourcePt);
-      html =
-        `<meta charset="utf-8">` +
-        buildSqrtInnerHTML(rich.contentHTML || rich.content || "", pt);
-    } else if (rich.kind === "sequence") {
-      html = buildSequenceHTML(rich.parts, sourcePt);
-    } else if (rich.kind === "text") {
-      // Pure text with no structural parts still needs an HTML
-      // version when the LaTeX had `_` or `^` — the HTML variant
-      // carries native <sub>/<sup> tags that Docs turns into real
-      // subscript/superscript formatting (Cmd+, / Cmd+.). Without
-      // this, the paste falls back to text/plain, which for
-      // unmappable args like `_{\delta}` shows as a literal "_δ".
-      const valueHTML = rich.valueHTML || "";
-      if (valueHTML && valueHTML.indexOf("<") >= 0) {
-        html = `<meta charset="utf-8">${valueHTML}`;
-      }
+    } finally {
+      renderCap = prevCap;
     }
     return { text: richToPlainText(rich), html };
   }
@@ -5220,7 +5326,7 @@
       html = `<meta charset="utf-8"><p style="margin:0;padding:0;line-height:1;">${escapeHTML(text)}</p>`;
       LOG("decompiling:", JSON.stringify(src), "→", JSON.stringify(text));
     } else {
-      const rendered = renderRich(region.rich, region.sourcePt);
+      const rendered = renderRich(region.rich, region.sourcePt, region.canvas);
       text = rendered.text;
       html = rendered.html;
       LOG(
